@@ -33,7 +33,8 @@ MARKER = ".claude-profiles-id"
 CONFIG = Path(os.environ.get("CLAUDE_PROFILES_CONFIG", HOME / ".config/claude-profiles/config.json"))
 LOG = Path(os.environ.get("CLAUDE_PROFILES_LOG", HOME / "Library/Logs/claude-profiles.log"))
 TRANSCRIPTS = HOME / ".claude/projects"
-APP = "/Applications/Claude.app"
+APP = next((p for p in ("/Applications/Claude.app", str(HOME / "Applications/Claude.app")) if os.path.isdir(p)),
+           "/Applications/Claude.app")
 NO_APP = os.environ.get("CLAUDE_PROFILES_NO_APP") == "1"      # tests: never touch the real app
 POLL = float(os.environ.get("CLAUDE_PROFILES_POLL", "10"))     # seconds between index checks after a first login
 DEFAULT_PROFILES = 2

@@ -9,7 +9,7 @@ APP="/Applications/Profiles for Claude.app"
 if ! command -v swiftc >/dev/null 2>&1; then
   echo "swiftc not found. Install the Xcode Command Line Tools first:  xcode-select --install"; exit 1
 fi
-[ -d /Applications/Claude.app ] || echo "Note: /Applications/Claude.app not found – install Claude Desktop first."
+[ -d /Applications/Claude.app ] || [ -d "$HOME/Applications/Claude.app" ] || echo "Note: Claude.app not found in /Applications or ~/Applications – install Claude Desktop first."
 
 mkdir -p "$BIN"
 install -m 755 "$HERE/bin/claude-profiles" "$BIN/claude-profiles"
