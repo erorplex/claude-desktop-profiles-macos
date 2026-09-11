@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""claude-profiles – multiple Claude accounts in ONE Claude Desktop app (macOS).
+
+The active profile always lives in the real data directory
+(~/Library/Application Support/Claude); every other profile is parked under
+~/Library/Application Support/Claude-profiles/<N>. Switching quits the app,
+renames the two directories (atomic, sub-second), syncs Code-tab sessions into
+the target profile and relaunches the app.
+
+  claude-profiles                     status: profiles, active one, usage
+  claude-profiles <N|label>           switch (relaunches the app)
+  claude-profiles next                switch to the next signed-in profile
+  claude-profiles label <N> <name>    name a profile
+  claude-profiles profiles <N>        set how many profile slots to show
+  claude-profiles import [--dry-run] [--archive-older-than DAYS] [--exclude PATH ...]
+                                      add Claude Code CLI / VS Code sessions to the app
+  claude-profiles status --json       machine-readable (used by the menu bar app)
+  claude-profiles repair              fix directory state after an interrupted switch
+"""
+import json, os, re, shutil, subprocess, sys, time, uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path(os.environ.get("CLAUDE_PROFILES_HOME", Path.home()))
+APP_SUPPORT = Path(os.environ.get("CLAUDE_PROFILES_APP_SUPPORT", HOME / "Library/Application Support"))
+LIVE = APP_SUPPORT / "Claude"
+PROFILES = APP_SUPPORT / "Claude-profiles"
+MANIFEST = PROFILES / "shared" / "sessions-manifest.json"
+MARKER = ".claude-profiles-id"
+CONFIG = Path(os.environ.get("CLAUDE_PROFILES_CONFIG", HOME / ".config/claude-profiles/config.json"))
+LOG = Path(os.environ.get("CLAUDE_PROFILES_LOG", HOME / "Library/Logs/claude-profiles.log"))
+TRANSCRIPTS = HOME / ".claude/projects"
+APP = "/Applications/Claude.app"
+NO_APP = os.environ.get("CLAUDE_PROFILES_NO_APP") == "1"      # tests: never touch the real app
+POLL = float(os.environ.get("CLAUDE_PROFILES_POLL", "10"))     # seconds between index checks after a first login
+DEFAULT_PROFILES = 4
+# session fields tied to the account (connectors, remote control) – reset when copying between profiles
+RESET = {"remoteMcpServersConfig": [], "enabledMcpTools": {}, "bridgeSessionIds": [],
+         "sessionPermissionUpdates": [], "alwaysAllowedReasons": []}
+FIVE_H, SEVEN_D = 5 * 3600, 7 * 86400
+TITLE_MAX = 60
+TEMP_PREFIXES = ("/private/tmp/", "/tmp/", "/private/var/folders/", "/var/folders/")   # throwaway sessions
+# a session index entry the app accepts; used when no existing entry can serve as template
+ENTRY_TEMPLATE = {
+    "model": "claude-opus-5", "effort": "high", "titleSource": "auto", "permissionMode": "default",
+    "enabledMcpTools": {}, "remoteMcpServersConfig": [], "chromePermissionMode": "ask_permission",
+    "completedTurns": 0, "titleTurn": 0, "lastSpawnRootDetected": False, "bypassChosenInApp": False,
+    "bridgeSessionIds": [], "remoteControlAutoEligible": False, "alwaysAllowedReasons": [],
+    "sessionPermissionUpdates": [], "classifierSummaryEnabled": True, "reportFindingsCard": True,
+    "spawnSeed": {},
+}
+
+
+# ---------- helpers ----------
+
+def log(msg):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+    if sys.stdout.isatty():
+        print(msg)
+
+
+def load_json(p, default):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return default
+
+
+def save_json(p, data):
+    Path(p).parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(p) + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp.replace(p)
+
+
+def config():
+    c = load_json(CONFIG, {})
+    c.setdefault("labels", {})
+    c.setdefault("profiles", DEFAULT_PROFILES)
+    return c
+
+
+def n_profiles():
+    return max(2, int(config()["profiles"]))
+
+
+def osascript(script):
+    if NO_APP:
+        return
+    subprocess.run(["osascript", "-e", script], capture_output=True)
+
+
+def notify(text):
+    osascript(f'display notification "{text}" with title "Claude Profiles"')
+
+
+def dialog(text):
+    osascript(f'display dialog "{text}" with title "Claude Profiles" buttons {{"OK"}} with icon caution')
+
+
+# ---------- profiles ----------
+
+def active_profile():
+    m = LIVE / MARKER
+    if LIVE.is_dir() and m.exists():
+        try:
+            return int(m.read_text().strip())
+        except ValueError:
+            pass
+    return None
+
+
+def profile_dir(n):
+    return LIVE if n == active_profile() else PROFILES / str(n)
+
+
+def index_dir(pdir):
+    """<profile>/claude-code-sessions/<account-id>/<org-id> – created by the app after login + opening the Code tab."""
+    base = pdir / "claude-code-sessions"
+    if not base.is_dir():
+        return None
+    for a in sorted(base.iterdir()):
+        if a.is_dir():
+            for o in sorted(a.iterdir()):
+                if o.is_dir():
+                    return o
+    return None
+
+
+def usage(pdir):
+    """Latest usage sample the app recorded: fh = 5-hour window %, sd = 7-day %."""
+    d = load_json(pdir / "plan-usage-history.json", None)
+    if not d or not d.get("samples"):
+        return {"fh": None, "sd": None, "age": None}
+    s = d["samples"][-1]
+    age = time.time() - s["t"] / 1000
+    u = s.get("u", {})
+    fh, sd = u.get("fh"), u.get("sd")
+    if age > FIVE_H:      # the 5-hour window has certainly reset
+        fh = 0
+    if age > SEVEN_D:
+        sd = 0
+    return {"fh": fh, "sd": sd, "age": int(age)}
+
+
+def logged_in(pdir):
+    c = load_json(pdir / "config.json", {})
+    return any(k.startswith("oauth:tokenCache") for k in c) or "lastKnownAccountUuid" in c
+
+
+def profiles():
+    cfg = config()
+    act = active_profile()
+    out = []
+    for n in range(1, n_profiles() + 1):
+        d = profile_dir(n)
+        exists = d.is_dir()
+        idx = index_dir(d) if exists else None
+        out.append({
+            "n": n,
+            "label": cfg["labels"].get(str(n), f"Account {n}"),
+            "active": n == act,
+            "exists": exists,
+            "logged_in": exists and logged_in(d),
+            "sessions": len(list(idx.glob("local_*.json"))) if idx else 0,
+            **(usage(d) if exists else {"fh": None, "sd": None, "age": None}),
+        })
+    return out
+
+
+def resolve(arg):
+    if arg.isdigit() and 1 <= int(arg) <= n_profiles():
+        return int(arg)
+    for p in profiles():
+        if p["label"].lower() == arg.lower():
+            return p["n"]
+    sys.exit(f"Unknown profile: {arg}  (1–{n_profiles()} or a label)")
+
+
+# ---------- session sync ----------
+
+def sessions_in(pdir):
+    idx = index_dir(pdir)
+    if not idx:
+        return None
+    out = {}
+    for f in idx.glob("local_*.json"):
+        d = load_json(f, None)
+        if isinstance(d, dict) and d.get("sessionId"):
+            out[d["sessionId"]] = (f, d)
+    return out
+
+
+def activity(d, f):
+    return d.get("lastActivityAt") or d.get("createdAt") or int(f.stat().st_mtime * 1000)
+
+
+def all_profile_dirs():
+    dirs = {n: profile_dir(n) for n in range(1, n_profiles() + 1)}
+    return {n: d for n, d in dirs.items() if d.is_dir()}
+
+
+def sync_sessions(target_n, source_n, dirs):
+    """Bring every profile's sessions into the target profile (newest version wins).
+    Deletions: a session the manifest lists for the profile we just left, but which is gone
+    there, was deleted by the user -> remove it everywhere."""
+    target_idx = index_dir(dirs[target_n])
+    if not target_idx:
+        log(f"profile {target_n}: no session index yet (sign in and open the Code tab) – syncing later")
+        return False
+    manifest = load_json(MANIFEST, {})
+    per_profile = {n: sessions_in(d) for n, d in dirs.items()}
+    per_profile = {n: s for n, s in per_profile.items() if s is not None}
+
+    src = per_profile.get(source_n)
+    if src is not None:
+        for sid, m in list(manifest.items()):
+            if source_n in m.get("profiles", []) and sid not in src:
+                for n, sess in per_profile.items():
+                    if sid in sess:
+                        sess[sid][0].unlink(missing_ok=True)
+                        del sess[sid]
+                        log(f"session {sid} removed from profile {n} (deleted in profile {source_n})")
+                del manifest[sid]
+
+    written = 0
+    for n, sess in per_profile.items():
+        for sid in sess:
+            m = manifest.setdefault(sid, {"profiles": []})
+            if n not in m["profiles"]:
+                m["profiles"].append(n)
+    all_sids = {sid for sess in per_profile.values() for sid in sess}
+    tgt = per_profile.get(target_n, {})
+    for sid in all_sids:
+        cands = [(activity(d, f), n, f, d) for n, sess in per_profile.items() if sid in sess for f, d in [sess[sid]]]
+        act, n, f, d = max(cands, key=lambda c: (c[0], c[1] == target_n))
+        if n == target_n:
+            continue
+        if sid in tgt and activity(tgt[sid][1], tgt[sid][0]) >= act:
+            continue
+        nd = dict(d)
+        nd.update(RESET)
+        (target_idx / f.name).write_text(json.dumps(nd))
+        written += 1
+        m = manifest[sid]
+        if target_n not in m["profiles"]:
+            m["profiles"].append(target_n)
+    save_json(MANIFEST, manifest)
+    log(f"sessions -> profile {target_n}: {written} updated, {len(all_sids)} total")
+
+    # local MCP servers are not account-bound: newest claude_desktop_config.json wins
+    cfgs = [(d / "claude_desktop_config.json") for d in dirs.values() if (d / "claude_desktop_config.json").exists()]
+    if cfgs:
+        newest = max(cfgs, key=lambda p: p.stat().st_mtime)
+        tgt_cfg = dirs[target_n] / "claude_desktop_config.json"
+        if newest != tgt_cfg and (not tgt_cfg.exists() or newest.stat().st_mtime > tgt_cfg.stat().st_mtime):
+            shutil.copy2(newest, tgt_cfg)
+            log(f"claude_desktop_config.json taken from {newest.parent.name}")
+    return True
+
+
+# ---------- app control ----------
+
+def claude_pids():
+    """Main process only (pgrep does not match it reliably on macOS)."""
+    r = subprocess.run(["ps", "-axo", "pid=,comm="], capture_output=True, text=True)
+    pids = []
+    for line in r.stdout.splitlines():
+        pid, _, comm = line.strip().partition(" ")
+        if comm.strip() == APP + "/Contents/MacOS/Claude":
+            pids.append(int(pid))
+    return pids
+
+
+def quit_claude():
+    if NO_APP or not claude_pids():
+        return
+    log("quitting Claude …")
+    subprocess.run(["osascript", "-e", 'tell application "Claude" to quit'], capture_output=True, timeout=15)
+    for _ in range(30):
+        if not claude_pids():
+            return
+        time.sleep(1)
+    log("Claude not responding – SIGTERM")
+    for p in claude_pids():
+        os.kill(p, 15)
+    for _ in range(10):
+        if not claude_pids():
+            return
+        time.sleep(1)
+    for p in claude_pids():
+        os.kill(p, 9)
+    time.sleep(1)
+
+
+def launch_claude():
+    if not NO_APP:
+        subprocess.run(["open", "-a", APP])
+
+
+# ---------- switching ----------
+
+def do_switch(target):
+    act = active_profile()
+    if act is None:
+        sys.exit("Active profile unknown – run `claude-profiles repair`.")
+    if target == act:
+        log(f"profile {target} is already active.")
+        return
+    cfg = config()
+    label = cfg["labels"].get(str(target), f"Account {target}")
+    log(f"=== switch profile {act} -> {target} ({label})")
+    quit_claude()
+    parked = PROFILES / str(act)
+    incoming = PROFILES / str(target)
+    if parked.exists():
+        dialog(f"Switch aborted: {parked} already exists. Run `claude-profiles repair`.")
+        sys.exit(1)
+    PROFILES.mkdir(parents=True, exist_ok=True)
+    LIVE.rename(parked)                                   # 1) park the active profile
+    try:                                                  # 2) activate the target (create on first use)
+        if not incoming.is_dir():
+            incoming.mkdir()
+            src_cfg = parked / "claude_desktop_config.json"
+            if src_cfg.exists():
+                shutil.copy2(src_cfg, incoming / "claude_desktop_config.json")
+        incoming.rename(LIVE)
+        (LIVE / MARKER).write_text(str(target))
+    except Exception as e:
+        log(f"ERROR activating: {e} – restoring profile {act}")
+        if not LIVE.exists():
+            parked.rename(LIVE)
+        dialog(f"Switch failed: {e}\\nProfile {act} was restored. Log: {LOG}")
+        launch_claude()
+        sys.exit(1)
+    cfg["active"] = target
+    save_json(CONFIG, cfg)
+    dirs = all_profile_dirs()                             # 3) sync sessions into the target
+    try:
+        synced = sync_sessions(target, act, dirs)
+    except Exception as e:
+        log(f"session sync failed (app starts anyway): {e}")
+        synced = True
+    launch_claude()                                       # 4) relaunch
+    if synced:
+        notify(f"Claude is now running as {label}.")
+    else:
+        notify(f"Claude is now running as {label}. Sign in and open the Code tab – your sessions follow automatically.")
+        for _ in range(90):                               # wait up to ~15 min for the first login
+            time.sleep(POLL)
+            if index_dir(LIVE):
+                time.sleep(POLL / 3)
+                try:
+                    sync_sessions(target, act, dirs)
+                    notify(f"Sessions added to {label}. If they are not in the sidebar yet, restart Claude once.")
+                except Exception as e:
+                    log(f"late sync failed: {e}")
+                break
+    log("switch complete.")
+
+
+def detach_and_switch(target):
+    """The switch must survive the app quitting (it may be our parent) -> run detached."""
+    if NO_APP:
+        return do_switch(target)
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as lf:
+        subprocess.Popen([sys.executable, __file__, "--detached", str(target)],
+                         stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, start_new_session=True)
+    print(f"Switching to profile {target} in the background – Claude relaunches in a moment. Log: {LOG}")
+
+
+# ---------- import of CLI / VS Code sessions ----------
+
+SKIP_PREFIXES = ("<local-command-caveat>", "<command-name>", "<command-message>", "<system-reminder>",
+                 "<ide_opened_file>", "<bash-input>", "<bash-stdout>", "<local-command-stdout>")
+
+
+def message_text(msg):
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "\n".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def iso_ms(ts):
+    try:
+        return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def make_title(text):
+    text = re.sub(r"<[^>]+>", " ", text)          # strip XML-ish tags
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    text = re.sub(r"\s+", " ", lines[0] if lines else "")   # first non-empty line, like the app does
+    if len(text) > TITLE_MAX:
+        text = text[:TITLE_MAX].rsplit(" ", 1)[0].rstrip(" ,.;:") + "…"
+    return text
+
+
+def read_transcript(path):
+    """First real user message, cwd, permission mode, time span, last model, user-turn count."""
+    info = {"cwd": None, "permissionMode": None, "first_ts": None, "last_ts": None,
+            "model": None, "turns": 0, "title": None}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            ts = iso_ms(d.get("timestamp", "")) if d.get("timestamp") else None
+            if ts:
+                info["first_ts"] = info["first_ts"] or ts
+                info["last_ts"] = max(info["last_ts"] or 0, ts)
+            t = d.get("type")
+            if t == "user" and not d.get("isSidechain"):
+                info["cwd"] = info["cwd"] or d.get("cwd")
+                info["permissionMode"] = info["permissionMode"] or d.get("permissionMode")
+                text = message_text(d.get("message", {}))
+                if text.strip() and not text.lstrip().startswith(SKIP_PREFIXES):
+                    info["turns"] += 1
+                    if info["title"] is None:
+                        info["title"] = make_title(text)
+            elif t == "assistant":
+                m = d.get("message", {}).get("model")
+                if m:
+                    info["model"] = m
+    return info
+
+
+def entry_template(idx):
+    """Copy the newest existing entry so the import matches whatever the installed app expects."""
+    files = sorted(idx.glob("local_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for f in files:
+        d = load_json(f, None)
+        if isinstance(d, dict) and d.get("cliSessionId"):
+            return d
+    return dict(ENTRY_TEMPLATE)
+
+
+def do_import(args):
+    dry = "--dry-run" in args
+    days = 30
+    if "--archive-older-than" in args:
+        days = int(args[args.index("--archive-older-than") + 1])
+    excludes = [str(Path(args[i + 1]).expanduser().resolve()) for i, a in enumerate(args) if a == "--exclude"]
+    idx = index_dir(LIVE)
+    if not idx:
+        sys.exit("The active profile has no session index yet – open the Code tab in Claude once, then retry.")
+    known = set()
+    for d in all_profile_dirs().values():
+        for _, e in (sessions_in(d) or {}).values():
+            known.add(e.get("cliSessionId"))
+    template = entry_template(idx)
+    now = int(time.time() * 1000)
+    cutoff = now - days * 86400 * 1000
+    imported, skipped_known, skipped_empty, skipped_excluded, skipped_cwd = 0, 0, 0, 0, []
+    manifest = load_json(MANIFEST, {})
+    act = active_profile()
+    for t in sorted(TRANSCRIPTS.glob("*/*.jsonl")):
+        sid = t.stem
+        if sid in known:
+            skipped_known += 1
+            continue
+        info = read_transcript(t)
+        if not info["title"] or not info["cwd"]:
+            skipped_empty += 1
+            continue
+        cwd = info["cwd"].rstrip("/") + "/"
+        if cwd.startswith(TEMP_PREFIXES) or any(cwd.startswith(e + "/") for e in excludes):
+            skipped_excluded += 1
+            continue
+        if not Path(info["cwd"]).is_dir():
+            skipped_cwd.append((info["title"], info["cwd"]))
+            continue
+        created = info["first_ts"] or int(t.stat().st_ctime * 1000)
+        last = info["last_ts"] or int(t.stat().st_mtime * 1000)
+        pm = info["permissionMode"] if info["permissionMode"] in ("default", "acceptEdits", "bypassPermissions") else "default"
+        entry = dict(template)
+        entry.update(RESET)
+        entry.update({
+            "sessionId": f"local_{uuid.uuid4()}", "cliSessionId": sid,
+            "cwd": info["cwd"], "originCwd": info["cwd"],
+            "createdAt": created, "lastActivityAt": last, "lastFocusedAt": last,
+            "title": info["title"], "titleSource": "auto", "isArchived": last < cutoff,
+            "completedTurns": info["turns"], "permissionMode": pm,
+            "model": info["model"] or template.get("model", ENTRY_TEMPLATE["model"]),
+            "bypassChosenInApp": pm == "bypassPermissions",
+        })
+        flag = " (archived)" if entry["isArchived"] else ""
+        print(f"  + {entry['title'][:TITLE_MAX]:{TITLE_MAX}}  {time.strftime('%Y-%m-%d', time.localtime(last / 1000))}{flag}")
+        if not dry:
+            (idx / f"{entry['sessionId']}.json").write_text(json.dumps(entry))
+            manifest.setdefault(entry["sessionId"], {"profiles": []})["profiles"].append(act)
+        imported += 1
+    if not dry:
+        save_json(MANIFEST, manifest)
+    for title, cwd in skipped_cwd:
+        print(f"  - skipped (cwd no longer exists: {cwd}): {title}")
+    verb = "would import" if dry else "imported"
+    print(f"\n{imported} {verb}, {skipped_known} already in the app, {skipped_empty} empty, "
+          f"{skipped_excluded} excluded (temp dirs / --exclude), {len(skipped_cwd)} skipped because their cwd is gone. "
+          f"Sessions older than {days} days are archived.")
+    if imported and not dry:
+        print("Restart Claude once if the sessions do not show up in the sidebar.")
+
+
+# ---------- repair & status ----------
+
+def repair():
+    act = active_profile()
+    cfg = config()
+    if LIVE.is_dir() and act is not None:
+        print(f"OK: active profile {act} is at {LIVE}")
+    elif LIVE.is_dir():
+        n = cfg.get("active", 1)
+        (LIVE / MARKER).write_text(str(n))
+        print(f"marker was missing – {LIVE} marked as profile {n}")
+    else:
+        n = cfg.get("active")
+        cand = [PROFILES / str(n)] if n else []
+        cand += [PROFILES / str(i) for i in range(1, n_profiles() + 1)]
+        for c in cand:
+            if c.is_dir():
+                c.rename(LIVE)
+                (LIVE / MARKER).write_text(c.name)
+                print(f"{c} -> {LIVE} restored (profile {c.name})")
+                break
+        else:
+            sys.exit("No profile found.")
+    for n in range(1, n_profiles() + 1):
+        p = PROFILES / str(n)
+        if p.is_dir() and n == active_profile():
+            print(f"WARNING: profile {n} is active but {p} also exists – please check manually.")
+
+
+def status(as_json=False):
+    ps = profiles()
+    if as_json:
+        print(json.dumps({"active": active_profile(), "profiles": ps}))
+        return
+    for p in ps:
+        mark = "●" if p["active"] else "○"
+        if not p["logged_in"]:
+            state = "not signed in"
+        else:
+            fh = f"{p['fh']}%" if p["fh"] is not None else "?"
+            sd = f"{p['sd']}%" if p["sd"] is not None else "?"
+            state = f"5h {fh:>4}  7d {sd:>4}  {p['sessions']} sessions"
+        print(f" {mark} {p['n']}  {p['label']:16} {state}")
+
+
+def main(argv):
+    if not argv:
+        return status()
+    cmd, args = argv[0], argv[1:]
+    if cmd == "status":
+        return status(as_json="--json" in args)
+    if cmd == "repair":
+        return repair()
+    if cmd == "import":
+        return do_import(args)
+    if cmd == "label" and len(args) >= 2:
+        cfg = config()
+        cfg["labels"][str(resolve(args[0]))] = " ".join(args[1:])
+        save_json(CONFIG, cfg)
+        return status()
+    if cmd == "profiles" and len(args) == 1 and args[0].isdigit():
+        cfg = config()
+        cfg["profiles"] = max(2, int(args[0]))
+        save_json(CONFIG, cfg)
+        return status()
+    if cmd == "--detached":
+        return do_switch(int(args[0]))
+    if cmd == "next":
+        ps = [p["n"] for p in profiles() if p["logged_in"]]
+        act = active_profile()
+        if act not in ps or len(ps) < 2:
+            sys.exit("No other signed-in profile.")
+        return detach_and_switch(ps[(ps.index(act) + 1) % len(ps)])
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    return detach_and_switch(resolve(cmd))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
