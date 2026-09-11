@@ -88,6 +88,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(mi)
         }
         menu.addItem(.separator())
+        let add = NSMenuItem(title: "Add profile…", action: #selector(addProfile), keyEquivalent: "")
+        add.target = self
+        menu.addItem(add)
         let next = NSMenuItem(title: "Next profile", action: #selector(nextSwitch), keyEquivalent: "n")
         next.target = self
         menu.addItem(next)
@@ -110,6 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         doSwitch([String(sender.tag)])
     }
     @objc func nextSwitch() { doSwitch(["next"]) }
+    @objc func addProfile() { doSwitch(["add", "--switch"]) }   // new slot; Claude relaunches signed out
     @objc func doRefresh() { refresh() }
 
     func doSwitch(_ args: [String]) {

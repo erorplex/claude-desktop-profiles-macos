@@ -27,22 +27,23 @@ mk_session s2 "Beta" 2000 > "$LIVE/claude-code-sessions/A1/O1/local_s2.json"
 mk_profile "$P/2" A2 O2 10 20; echo 2 > "$P/2/.claude-profiles-id"
 mk_session s3 "Gamma" 3000 > "$P/2/claude-code-sessions/A2/O2/local_s3.json"
 
-echo "# status"
+echo "# status (Standard: 2 Slots)"
 "$CLI" | grep -q '● 1' || fail "Profil 1 nicht aktiv"
-"$CLI" status --json | python3 -c 'import json,sys;d=json.load(sys.stdin);assert d["active"]==1 and len(d["profiles"])==4' && ok "status"
+"$CLI" status --json | python3 -c 'import json,sys;d=json.load(sys.stdin);assert d["active"]==1 and len(d["profiles"])==2' || fail "status"; ok "status"
+"$CLI" profiles 4 >/dev/null
 
 echo "# switch 1 -> 2: Sessions kommen mit, Account-Felder zurückgesetzt"
 "$CLI" 2 >/dev/null
 [ "$(cat "$LIVE/.claude-profiles-id")" = 2 ] || fail "Wechsel zu 2"
 [ -f "$LIVE/claude-code-sessions/A2/O2/local_s1.json" ] || fail "s1 fehlt in Profil 2"
-python3 -c "import json;d=json.load(open('$LIVE/claude-code-sessions/A2/O2/local_s1.json'));assert d['remoteMcpServersConfig']==[] and d['bridgeSessionIds']==[] and d['title']=='Alpha'" && ok "switch + sync"
+python3 -c "import json;d=json.load(open('$LIVE/claude-code-sessions/A2/O2/local_s1.json'));assert d['remoteMcpServersConfig']==[] and d['bridgeSessionIds']==[] and d['title']=='Alpha'" || fail "switch + sync"; ok "switch + sync"
 
 echo "# Änderung + Löschung in 2 propagieren nach 1"
 python3 -c "import json;p='$LIVE/claude-code-sessions/A2/O2/local_s1.json';d=json.load(open(p));d['title']='Alpha NEU';d['lastActivityAt']=9000;json.dump(d,open(p,'w'))"
 rm "$LIVE/claude-code-sessions/A2/O2/local_s2.json"
 "$CLI" 1 >/dev/null
 [ ! -f "$LIVE/claude-code-sessions/A1/O1/local_s2.json" ] || fail "s2 sollte in 1 gelöscht sein"
-python3 -c "import json;d=json.load(open('$LIVE/claude-code-sessions/A1/O1/local_s1.json'));assert d['title']=='Alpha NEU'" && ok "Update + Löschung propagiert"
+python3 -c "import json;d=json.load(open('$LIVE/claude-code-sessions/A1/O1/local_s1.json'));assert d['title']=='Alpha NEU'" || fail "Update + Löschung propagiert"; ok "Update + Löschung propagiert"
 
 echo "# Wechsel in nie benutztes Profil 3: Nach-Sync sobald Index da ist"
 ( sleep 0.5; mkdir -p "$LIVE/claude-code-sessions/A3/O3"; echo '{"lastKnownAccountUuid":"x"}' > "$LIVE/config.json" ) &
@@ -56,6 +57,26 @@ echo "# next, label, profiles-Anzahl"
 "$CLI" label 2 "Arbeit" >/dev/null; "$CLI" | grep -q 'Arbeit' || fail "label"
 "$CLI" profiles 6 >/dev/null; "$CLI" status --json | python3 -c 'import json,sys;assert len(json.load(sys.stdin)["profiles"])==6'
 "$CLI" profiles 4 >/dev/null; ok "next/label/profiles"
+
+echo "# add: neuer Slot mit Label, add --switch wechselt sofort hinein"
+"$CLI" add "Kunde X" | grep -q '5' || fail "add sollte Slot 5 melden"
+"$CLI" status --json | python3 -c 'import json,sys;d=json.load(sys.stdin);p=d["profiles"];assert len(p)==5 and p[4]["label"]=="Kunde X" and not p[4]["logged_in"]'
+( sleep 0.5; mkdir -p "$LIVE/claude-code-sessions/A6/O6"; echo '{"lastKnownAccountUuid":"x"}' > "$LIVE/config.json" ) &
+"$CLI" add --switch >/dev/null; wait
+[ "$(cat "$LIVE/.claude-profiles-id")" = 6 ] || fail "add --switch sollte zu Slot 6 wechseln"
+[ -f "$LIVE/claude-code-sessions/A6/O6/local_s3.json" ] || fail "Sessions nicht in neues Profil synchronisiert"
+ok "add"
+
+echo "# remove: aktives Profil verweigern, geparktes löschen, letzten Slot einkürzen"
+"$CLI" remove 6 --yes >/dev/null 2>&1 && fail "remove des aktiven Profils muss scheitern"
+"$CLI" 1 >/dev/null
+"$CLI" remove 6 --yes >/dev/null; [ ! -d "$P/6" ] || fail "Profil 6 nicht gelöscht"
+"$CLI" status --json | python3 -c 'import json,sys;p=json.load(sys.stdin)["profiles"];assert len(p)==5 and p[4]["label"]=="Kunde X", "benannter leerer Slot 5 muss bleiben"'
+"$CLI" remove 5 --yes >/dev/null
+"$CLI" status --json | python3 -c 'import json,sys;assert len(json.load(sys.stdin)["profiles"])==4, "Slot 5 nach remove weg"'
+"$CLI" remove 2 --yes >/dev/null; [ ! -d "$P/2" ] || fail "Profil 2 nicht gelöscht"
+"$CLI" status --json | python3 -c 'import json,sys;p=json.load(sys.stdin)["profiles"];assert len(p)==4 and not p[1]["logged_in"] and p[1]["label"]=="Account 2", "Slot 2 muss leer bleiben"'
+ok "remove"
 
 echo "# repair"
 mv "$LIVE" "$P/1"; "$CLI" repair >/dev/null; [ "$(cat "$LIVE/.claude-profiles-id")" = 1 ] || fail "repair"; ok "repair"
@@ -104,8 +125,8 @@ grep -q 'cwd' "$T/imp.txt" || fail "Übersprungene (cwd fehlt) nicht gemeldet"
 "$CLI" import --exclude "$T/home/.bot" | grep -q "^0 imported" || fail "zweiter Import muss idempotent sein"
 ok "import"
 
-echo "# import-Einträge kommen beim Wechsel mit"
-"$CLI" 2 >/dev/null
-ls "$LIVE/claude-code-sessions/A2/O2/" | grep -c local_ | grep -q 4 || fail "importierte Sessions nicht synchronisiert"
+echo "# import-Einträge kommen beim Wechsel mit (Profil 2 wurde oben entfernt -> Profil 3)"
+"$CLI" 3 >/dev/null
+ls "$LIVE/claude-code-sessions/A3/O3/" | grep -c local_ | grep -q 4 || fail "importierte Sessions nicht synchronisiert"
 ok "import + sync"
 echo "ALLE TESTS OK"

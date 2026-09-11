@@ -36,9 +36,12 @@ Claude Desktop profile
 ● Account 1   ·   5 h: 2 %    7 d: 1 %
 ○ Account 2   ·   5 h: 7 %    7 d: 62 %
 ○ Account 3   ·   not signed in yet
+──────────────
+Add profile…
+Next profile
 ```
 
-The first time you switch to an empty profile, Claude starts signed out — sign in with the other account and open the *Code* tab once; your sessions are added automatically. From then on the profile stays signed in.
+**Adding an account:** choose *Add profile…*. Claude relaunches signed out — sign in with the other account and open the *Code* tab once; your sessions are added automatically. From then on the profile stays signed in. Repeat for as many accounts as you have.
 
 Everything is also available from the terminal:
 
@@ -46,8 +49,9 @@ Everything is also available from the terminal:
 claude-profiles                 # status
 claude-profiles 2               # switch to profile 2 (or: claude-profiles work)
 claude-profiles next            # next signed-in profile
+claude-profiles add work        # new profile slot (add --switch: switch into it right away)
+claude-profiles remove 3        # delete a parked profile's sign-in and data (asks first)
 claude-profiles label 2 work    # name a profile
-claude-profiles profiles 3      # number of profile slots (default 4)
 ```
 
 ### Import sessions from the CLI or VS Code

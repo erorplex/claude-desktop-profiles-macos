@@ -10,6 +10,9 @@ the target profile and relaunches the app.
   claude-profiles                     status: profiles, active one, usage
   claude-profiles <N|label>           switch (relaunches the app)
   claude-profiles next                switch to the next signed-in profile
+  claude-profiles add [name] [--switch]
+                                      add a profile slot (and switch into it to sign in)
+  claude-profiles remove <N> [--yes]  delete a parked profile's data (never the active one)
   claude-profiles label <N> <name>    name a profile
   claude-profiles profiles <N>        set how many profile slots to show
   claude-profiles import [--dry-run] [--archive-older-than DAYS] [--exclude PATH ...]
@@ -33,7 +36,7 @@ TRANSCRIPTS = HOME / ".claude/projects"
 APP = "/Applications/Claude.app"
 NO_APP = os.environ.get("CLAUDE_PROFILES_NO_APP") == "1"      # tests: never touch the real app
 POLL = float(os.environ.get("CLAUDE_PROFILES_POLL", "10"))     # seconds between index checks after a first login
-DEFAULT_PROFILES = 4
+DEFAULT_PROFILES = 2
 # session fields tied to the account (connectors, remote control) – reset when copying between profiles
 RESET = {"remoteMcpServersConfig": [], "enabledMcpTools": {}, "bridgeSessionIds": [],
          "sessionPermissionUpdates": [], "alwaysAllowedReasons": []}
@@ -443,6 +446,49 @@ def entry_template(idx):
     return dict(ENTRY_TEMPLATE)
 
 
+def do_add(args):
+    cfg = config()
+    n = n_profiles() + 1
+    cfg["profiles"] = n
+    label = " ".join(a for a in args if a != "--switch").strip()
+    if label:
+        cfg["labels"][str(n)] = label
+    save_json(CONFIG, cfg)
+    print(f"Added profile {n}{' (' + label + ')' if label else ''}. Switch into it and sign in: claude-profiles {n}")
+    if "--switch" in args:
+        detach_and_switch(n)
+
+
+def do_remove(args):
+    nums = [a for a in args if a.isdigit()]
+    if not nums:
+        sys.exit("Usage: claude-profiles remove <N> [--yes]")
+    n = int(nums[0])
+    if n == active_profile():
+        sys.exit(f"Profile {n} is active – switch to another profile first.")
+    if not 1 <= n <= n_profiles():
+        sys.exit(f"No profile {n}.")
+    d = PROFILES / str(n)
+    cfg = config()
+    label = cfg["labels"].get(str(n), f"Account {n}")
+    if d.is_dir() and "--yes" not in args:
+        if input(f"Delete the sign-in and data of profile {n} ({label})? Sessions stay in the other profiles. [y/N] ").strip().lower() != "y":
+            sys.exit("Cancelled.")
+    if d.is_dir():
+        shutil.rmtree(d)
+    manifest = load_json(MANIFEST, {})
+    for m in manifest.values():
+        if n in m.get("profiles", []):
+            m["profiles"].remove(n)
+    save_json(MANIFEST, manifest)
+    cfg["labels"].pop(str(n), None)
+    if n == n_profiles():                     # removing the last slot shrinks the list; others stay as empty slots
+        cfg["profiles"] = max(2, n - 1)
+    save_json(CONFIG, cfg)
+    log(f"profile {n} ({label}) removed")
+    print(f"Profile {n} ({label}) removed.")
+
+
 def do_import(args):
     dry = "--dry-run" in args
     days = 30
@@ -565,6 +611,10 @@ def main(argv):
         return repair()
     if cmd == "import":
         return do_import(args)
+    if cmd == "add":
+        return do_add(args)
+    if cmd == "remove":
+        return do_remove(args)
     if cmd == "label" and len(args) >= 2:
         cfg = config()
         cfg["labels"][str(resolve(args[0]))] = " ".join(args[1:])
