@@ -4,6 +4,8 @@ Use several Claude accounts in **one** Claude Desktop app — switch from the me
 
 > Unofficial. Not affiliated with or endorsed by Anthropic. It works by moving the app's data directory around, so an app update that changes the internal layout may break it — see [Caveats](#caveats).
 
+<img src="docs/menu.png" width="560" alt="The Profiles for Claude menu: four profiles with their 5-hour and 7-day usage, the active one checked, plus Add profile and Next profile">
+
 ## Why
 
 Claude Desktop knows exactly one sign-in at a time. If you keep a personal account and a work account (or one per client), every switch means sign out → sign in → lose your place. This tool gives the app *profiles*, the way Chrome and Slack have them:
@@ -29,17 +31,7 @@ The app is ad-hoc signed (no Apple developer account involved). If macOS refuses
 
 ## Use
 
-Click the person icon in the menu bar (top right, next to the clock) and pick a profile:
-
-```
-Claude Desktop profile
-● Account 1   ·   5 h: 2 %    7 d: 1 %
-○ Account 2   ·   5 h: 7 %    7 d: 62 %
-○ Account 3   ·   not signed in yet
-──────────────
-Add profile…
-Next profile
-```
+Click the person icon in the menu bar (top right, next to the clock) and pick a profile. The menu shows each profile's usage in the current 5-hour window and the 7-day window; ⌘1–⌘9 switch directly.
 
 **Adding an account:** choose *Add profile…*. Claude relaunches signed out — sign in with the other account and open the *Code* tab once; your sessions are added automatically. From then on the profile stays signed in. Repeat for as many accounts as you have.
 
