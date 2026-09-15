@@ -63,14 +63,28 @@ Claude Desktop keeps everything about the signed-in account in `~/Library/Applic
 
 1. quits Claude,
 2. renames the active directory into the parking lot and the target directory into place (two renames, sub-second, no copying),
-3. syncs the Code-tab session index into the target profile — the newest version of each session wins, sessions you deleted in one profile are removed from the others, and account-bound fields (connectors, remote-control links) are reset,
+3. syncs the Code-tab session index into the target profile — every change made in the profile you just left travels along, sessions you deleted in one profile are removed from the others, and account-bound fields (connectors, remote-control links) stay with the target,
 4. relaunches Claude.
 
 Session transcripts live in `~/.claude/projects` and are shared by all profiles anyway; only the small index entries the app uses for its sidebar are synced. Local MCP servers (`claude_desktop_config.json`) are shared too. Sign-in tokens are never read, copied or touched — the sign-in happens in Claude's own flow.
 
+### What travels with you
+
+Only one profile is in use between two switches, so whatever differs there from the state recorded at the previous switch is a real change and wins; a profile you have not visited for a while is stale, not changed. The state of the last switch is kept in `Claude-profiles/shared/sessions-snapshot.json`. This is what carries titles, permission modes and archiving, none of which touch a session's last-activity timestamp:
+
+| | |
+|---|---|
+| Sessions, titles, permission mode | `claude-code-sessions/<account>/<org>/local_*.json` |
+| Archived / restored | `archived-sessions.idx` plus `isArchived` per entry |
+| Which session sits in which sidebar group | `claude_desktop_config.json` → `preferences.epitaxyPrefs.dframe-group-scopes` |
+| Local MCP servers, pins | `claude_desktop_config.json` |
+
+Groups are matched by **name**, since each account has its own group ids.
+
 ## Caveats
 
 - **Chats in the Chat tab stay with their account.** They live on Anthropic's servers; only Code-tab sessions carry over.
+- **The groups themselves stay with their account.** The sidebar store is synced per account by Claude itself (`ccd/dframe-store`), so the app restores that account's own group names and their order on launch and overwrites anything written locally. Which session sits in which group does travel; creating, renaming or reordering a group has to be done once per account.
 - **One account at a time.** Switching relaunches the app; a running response is interrupted (the session resumes fine afterwards).
 - **Relies on the app's internal layout.** The session index format and `plan-usage-history.json` are not public APIs. If an update changes them, run `claude-profiles repair`, check `~/Library/Logs/claude-profiles.log`, and open an issue.
 - **Sign in with one profile at a time.** The browser sign-in returns to the app via a URL callback; make sure only the intended profile is running while you sign in (that is always the case unless you also start Claude with `--user-data-dir` yourself).
@@ -91,6 +105,7 @@ Removes the CLI and the menu bar app. The active profile stays in place, so Clau
 
 ```bash
 ./tests/test_cli.sh     # end-to-end tests in a sandbox; never touches the real app
+python3 tests/test_sync.py   # what a switch carries over, in a sandbox as well
 ```
 
 `bin/claude-profiles` is a single Python 3 file with no dependencies; `menubar/main.swift` is the menu bar app.

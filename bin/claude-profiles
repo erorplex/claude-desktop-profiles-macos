@@ -20,7 +20,8 @@ the target profile and relaunches the app.
   claude-profiles status --json       machine-readable (used by the menu bar app)
   claude-profiles repair              fix directory state after an interrupted switch
 """
-import json, os, re, shutil, subprocess, sys, time, uuid
+import hashlib, json, os, re, shutil, subprocess, sys, time, uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -206,8 +207,46 @@ def all_profile_dirs():
     return {n: d for n, d in dirs.items() if d.is_dir()}
 
 
+SNAPSHOT = PROFILES / "shared" / "sessions-snapshot.json"
+MONOTONIC = {"lastActivityAt", "lastFocusedAt", "completedTurns"}      # never taken backwards
+GROUP_SCOPES = "dframe-group-scopes"          # preferences.epitaxyPrefs[...] in claude_desktop_config.json
+_MISSING = object()
+
+
+def fingerprint(v):
+    if v is _MISSING:
+        return "-"
+    return hashlib.sha1(json.dumps(v, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
+def merge_session(copies, source_n, base):
+    """copies: {profile: session entry}; base: {field: fingerprint} written at the previous switch, or None.
+    Between two switches only the profile just left was in use, so with a trusted base its deviations are the
+    real changes and any other deviation is a stale copy. Without a trusted base the majority decides.
+    Renames, permission modes and archiving leave lastActivityAt alone - this is what carries them."""
+    order = sorted(copies, key=lambda n: (n == source_n, copies[n].get("lastActivityAt") or 0), reverse=True)
+    merged = {}
+    for k in set().union(*copies.values()) - set(RESET):
+        vals = {n: copies[n].get(k, _MISSING) for n in order}
+        want = base.get(k, "-") if base is not None else None
+        if k in MONOTONIC:
+            nums = [v for v in vals.values() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            v = max(nums) if nums else vals[order[0]]
+        elif base is not None and source_n in vals and fingerprint(vals[source_n]) != want:
+            v = vals[source_n]
+        elif base is not None and any(fingerprint(x) == want for x in vals.values()):
+            v = next(x for x in vals.values() if fingerprint(x) == want)
+        else:
+            counts = Counter(fingerprint(x) for x in vals.values())
+            top = max(counts.values())
+            v = next(x for x in vals.values() if counts[fingerprint(x)] == top)
+        if v is not _MISSING:
+            merged[k] = v
+    return merged
+
+
 def sync_sessions(target_n, source_n, dirs):
-    """Bring every profile's sessions into the target profile (newest version wins).
+    """Bring every profile's sessions into the target profile (three-way, see merge_session).
     Deletions: a session the manifest lists for the profile we just left, but which is gone
     there, was deleted by the user -> remove it everywhere."""
     target_idx = index_dir(dirs[target_n])
@@ -215,6 +254,11 @@ def sync_sessions(target_n, source_n, dirs):
         log(f"profile {target_n}: no session index yet (sign in and open the Code tab) – syncing later")
         return False
     manifest = load_json(MANIFEST, {})
+    snap = load_json(SNAPSHOT, {})
+    trusted = snap.get("target") == source_n
+    bases = snap.get("sessions", {}) if trusted else {}
+    if not trusted:
+        log(f"no trusted snapshot for profile {source_n} – majority decides this time")
     per_profile = {n: sessions_in(d) for n, d in dirs.items()}
     per_profile = {n: s for n, s in per_profile.items() if s is not None}
 
@@ -229,7 +273,6 @@ def sync_sessions(target_n, source_n, dirs):
                         log(f"session {sid} removed from profile {n} (deleted in profile {source_n})")
                 del manifest[sid]
 
-    written = 0
     for n, sess in per_profile.items():
         for sid in sess:
             m = manifest.setdefault(sid, {"profiles": []})
@@ -237,32 +280,100 @@ def sync_sessions(target_n, source_n, dirs):
                 m["profiles"].append(n)
     all_sids = {sid for sess in per_profile.values() for sid in sess}
     tgt = per_profile.get(target_n, {})
+    written, fps, archived = 0, {}, set()
     for sid in all_sids:
-        cands = [(activity(d, f), n, f, d) for n, sess in per_profile.items() if sid in sess for f, d in [sess[sid]]]
-        act, n, f, d = max(cands, key=lambda c: (c[0], c[1] == target_n))
-        if n == target_n:
+        copies = {n: sess[sid][1] for n, sess in per_profile.items() if sid in sess}
+        merged = merge_session(copies, source_n, bases.get(sid))
+        fps[sid] = {k: fingerprint(v) for k, v in merged.items()}
+        if merged.get("isArchived"):
+            archived.add(sid)
+        own = tgt[sid][1] if sid in tgt else {}
+        out = {**merged, **{k: own.get(k, v) for k, v in RESET.items()}}      # account-bound fields stay the target's
+        if sid in tgt and tgt[sid][1] == out:
             continue
-        if sid in tgt and activity(tgt[sid][1], tgt[sid][0]) >= act:
-            continue
-        nd = dict(d)
-        nd.update(RESET)
-        (target_idx / f.name).write_text(json.dumps(nd))
+        name = next(sess[sid][0].name for sess in per_profile.values() if sid in sess)
+        (target_idx / name).write_text(json.dumps(out))
         written += 1
-        m = manifest[sid]
-        if target_n not in m["profiles"]:
-            m["profiles"].append(target_n)
+        if target_n not in manifest[sid]["profiles"]:
+            manifest[sid]["profiles"].append(target_n)
     save_json(MANIFEST, manifest)
+    save_json(SNAPSHOT, {"target": target_n, "sessions": fps})
+    write_archive_index(target_idx, archived, all_sids)
     log(f"sessions -> profile {target_n}: {written} updated, {len(all_sids)} total")
+    sync_config(target_n, source_n, dirs, trusted)
+    return True
 
-    # local MCP servers are not account-bound: newest claude_desktop_config.json wins
+
+def write_archive_index(idx, archived, known):
+    """The app keeps archiving twice: isArchived per entry and archived-sessions.idx - keep both in step."""
+    p = idx / "archived-sessions.idx"
+    cur = load_json(p, {}) or {}
+    have = cur.get("archived", []) if isinstance(cur.get("archived"), list) else []
+    want = sorted(archived | {s for s in have if s not in known})
+    if sorted(have) != want:
+        p.write_text(json.dumps({"v": cur.get("v", 1), "archived": want}))
+
+
+def scope_of(pdir):
+    idx = index_dir(pdir)
+    return f"{idx.parent.name}/{idx.name}" if idx else None
+
+
+def group_entry(pdir):
+    """(scope, {groups, assignments, order}) the app stores for this profile's own account, or (scope, None)."""
+    scope = scope_of(pdir)
+    cfg = load_json(pdir / "claude_desktop_config.json", {})
+    scopes = cfg.get("preferences", {}).get("epitaxyPrefs", {}).get(GROUP_SCOPES, {})
+    e = scopes.get(scope) if scope else None
+    return scope, (e if isinstance(e, dict) and isinstance(e.get("groups"), list) else None)
+
+
+def merge_groups(target, source):
+    """Source groups under the target's ids where the names match, so the app's bookkeeping stays consistent."""
+    if not source:
+        return target
+    by_name = {g["name"]: g["id"] for g in (target or {}).get("groups", []) if "name" in g and "id" in g}
+    idmap = {g["id"]: by_name.get(g["name"], g["id"]) for g in source.get("groups", [])}
+    return {
+        "groups": [{**g, "id": idmap[g["id"]]} for g in source.get("groups", [])],
+        "assignments": {k: idmap.get(v, v) for k, v in source.get("assignments", {}).items()},
+        "order": {idmap.get(gid, gid): list(keys) for gid, keys in source.get("order", {}).items()},
+    }
+
+
+def sync_config(target_n, source_n, dirs, trusted):
+    """Local MCP servers are not account-bound: the newest claude_desktop_config.json wins. The same file
+    carries the Code-tab sidebar groups keyed by <account>/<org>, so those are re-keyed to the target's
+    scope instead of copied - and they follow the profile just left, whichever config file is newer."""
+    tgt_dir = dirs[target_n]
+    tgt_cfg = tgt_dir / "claude_desktop_config.json"
+    tgt_scope, tgt_entry = group_entry(tgt_dir)                  # read before anything is copied over
+    src_entry = group_entry(dirs[source_n])[1] if source_n in dirs else None
+    base, origin = load_json(tgt_cfg, None), None
     cfgs = [(d / "claude_desktop_config.json") for d in dirs.values() if (d / "claude_desktop_config.json").exists()]
     if cfgs:
         newest = max(cfgs, key=lambda p: p.stat().st_mtime)
-        tgt_cfg = dirs[target_n] / "claude_desktop_config.json"
         if newest != tgt_cfg and (not tgt_cfg.exists() or newest.stat().st_mtime > tgt_cfg.stat().st_mtime):
-            shutil.copy2(newest, tgt_cfg)
-            log(f"claude_desktop_config.json taken from {newest.parent.name}")
-    return True
+            cand = load_json(newest, None)
+            if not isinstance(cand, dict):
+                shutil.copy2(newest, tgt_cfg)
+                log(f"claude_desktop_config.json taken from {newest.parent.name} (unparsed)")
+                return
+            base, origin = cand, newest.parent.name
+    if not isinstance(base, dict) or not tgt_scope:
+        return
+    entry = merge_groups(tgt_entry, src_entry) if trusted else (tgt_entry or merge_groups(None, src_entry))
+    if trusted and src_entry is None:
+        entry = None
+    prefs = base.setdefault("preferences", {}).setdefault("epitaxyPrefs", {})
+    scopes = {tgt_scope: entry} if entry else {}
+    if origin is None and prefs.get(GROUP_SCOPES, {}) == scopes:
+        return
+    prefs[GROUP_SCOPES] = scopes
+    save_json(tgt_cfg, base)
+    n, a = (len(entry.get("groups", [])), len(entry.get("assignments", {}))) if entry else (0, 0)
+    log((f"claude_desktop_config.json taken from {origin}; " if origin else "")
+        + f"sidebar groups for profile {target_n}: {n} groups, {a} filed sessions")
 
 
 # ---------- app control ----------
