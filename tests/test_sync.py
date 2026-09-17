@@ -106,6 +106,26 @@ class SwitchTests(unittest.TestCase):
 
     # --- neue Anforderungen ---
 
+    def test_index_ignoriert_alte_konten_und_fremde_orgs(self):
+        """Der Datenordner kann Indizes frueherer Logins und anderer Orgs enthalten - es zaehlt der
+        Account aus config.json und darin die zuletzt beruehrte Org, nicht die alphabetisch erste."""
+        import time
+        d = self.r.pdir(1)
+        old = time.time() - 30 * 86400
+        stale_acct = d / "claude-code-sessions" / "00000000-0000-0000-0000-000000000000" / "o-stale"
+        stale_acct.mkdir(parents=True)
+        (stale_acct / "local_stale.json").write_text(json.dumps({"sessionId": "local_stale"}))
+        os.utime(stale_acct, (old, old))
+        other_org = self.r.idx(1).parent / "00000000-other-org"
+        other_org.mkdir()
+        for i in range(5):
+            (other_org / f"local_o{i}.json").write_text(json.dumps({"sessionId": f"local_o{i}"}))
+        for f in list(other_org.iterdir()) + [other_org]:
+            os.utime(f, (old, old))
+        st = json.loads(subprocess.run([sys.executable, SCRIPT, "status", "--json"], env=self.r.env,
+                                       capture_output=True, text=True).stdout)
+        self.assertEqual(st["profiles"][0]["sessions"], len(SIDS))
+
     def test_umbenennung_wandert_ins_zielkonto(self):
         self.r.edit("local_s1", title="ebay-rechnungen", titleSource="user")
         self.r.switch(2)

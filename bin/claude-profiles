@@ -121,17 +121,31 @@ def profile_dir(n):
     return LIVE if n == active_profile() else PROFILES / str(n)
 
 
+def touched(d):
+    """Latest modification inside a directory – the app touches the active index on every session change."""
+    try:
+        return max([d.stat().st_mtime] + [p.stat().st_mtime for p in d.iterdir()])
+    except OSError:
+        return 0
+
+
 def index_dir(pdir):
-    """<profile>/claude-code-sessions/<account-id>/<org-id> – created by the app after login + opening the Code tab."""
+    """<profile>/claude-code-sessions/<account-id>/<org-id> – created by the app after login + opening the Code tab.
+    The directory can also hold indexes of earlier sign-ins and of other organizations of the same account:
+    prefer the account config.json names, and within it the most recently touched organization."""
     base = pdir / "claude-code-sessions"
     if not base.is_dir():
         return None
-    for a in sorted(base.iterdir()):
-        if a.is_dir():
-            for o in sorted(a.iterdir()):
-                if o.is_dir():
-                    return o
-    return None
+    known = load_json(pdir / "config.json", {}).get("lastKnownAccountUuid")
+    cands = []
+    for a in base.iterdir():
+        if not a.is_dir():
+            continue
+        orgs = [o for o in a.iterdir() if o.is_dir()]
+        if orgs:
+            best = max(orgs, key=touched)
+            cands.append((a.name == known, touched(best), best))
+    return max(cands, key=lambda c: c[:2])[2] if cands else None
 
 
 def usage(pdir):
