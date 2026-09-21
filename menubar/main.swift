@@ -4,9 +4,33 @@ import Cocoa
 
 let cli = NSHomeDirectory() + "/.local/bin/claude-profiles"
 
+struct Window: Decodable {
+    let key: String; let label: String?; let percentUsed: Int?; let resetsAt: Double?
+
+    var short: String {                     // five_hour -> "5 h", weekly_fable -> "Fable"
+        switch key {
+        case "five_hour": return "5 h"
+        case "weekly": return "7 d"
+        default:
+            if let l = label, l.contains("·") {
+                return l.components(separatedBy: "·").last!.trimmingCharacters(in: .whitespaces)
+            }
+            return label ?? key
+        }
+    }
+    var used: String { percentUsed.map { "\($0) %" } ?? "–" }
+    var reset: String? {                    // clock time today, weekday + time later on
+        guard let ms = resetsAt else { return nil }
+        let d = Date(timeIntervalSince1970: ms / 1000)
+        let f = DateFormatter()
+        f.locale = Locale.current
+        f.dateFormat = Calendar.current.isDateInToday(d) ? "HH:mm" : "EEE HH:mm"
+        return f.string(from: d)
+    }
+}
 struct Profile: Decodable {
     let n: Int; let label: String; let active: Bool; let logged_in: Bool
-    let sessions: Int; let fh: Int?; let sd: Int?
+    let sessions: Int; let fh: Int?; let sd: Int?; let windows: [Window]?
 }
 struct Status: Decodable { let active: Int?; let profiles: [Profile] }
 
@@ -66,6 +90,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.button?.title = switching ? "  switching…" : "  " + title
     }
 
+    /// Two lines per profile: the limits on top, when they reset underneath.
+    func limitsTitle(_ p: Profile) -> NSAttributedString {
+        var windows = p.windows ?? []
+        if windows.isEmpty {        // older CLI without recorded windows
+            windows = [Window(key: "five_hour", label: nil, percentUsed: p.fh, resetsAt: nil),
+                       Window(key: "weekly", label: nil, percentUsed: p.sd, resetsAt: nil)]
+        }
+        let used = windows.map { "\($0.short) \($0.used)" }.joined(separator: "   ")
+        let resets = windows.compactMap { w in w.reset.map { "\(w.short) \($0)" } }
+        let t = NSMutableAttributedString(string: p.label + "   ·   " + used,
+                                          attributes: [.font: NSFont.menuFont(ofSize: 0)])
+        if !resets.isEmpty {
+            t.append(NSAttributedString(string: "\nresets  " + resets.joined(separator: " · "),
+                                        attributes: [.font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
+                                                     .foregroundColor: NSColor.secondaryLabelColor]))
+        }
+        return t
+    }
+
     func buildMenu(_ st: Status) -> NSMenu {
         let menu = NSMenu()
         menu.delegate = self
@@ -73,15 +116,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         head.isEnabled = false
         menu.addItem(head)
         for p in st.profiles {
-            var text = p.label
+            let mi = NSMenuItem(title: p.label, action: #selector(switchTo(_:)), keyEquivalent: p.n <= 9 ? String(p.n) : "")
             if p.logged_in {
-                let fh = p.fh.map { "\($0) %" } ?? "–"
-                let sd = p.sd.map { "\($0) %" } ?? "–"
-                text += "   ·   5 h: \(fh)   7 d: \(sd)"
+                mi.attributedTitle = limitsTitle(p)
             } else {
-                text += "   ·   not signed in yet"
+                mi.title = p.label + "   ·   not signed in yet"
             }
-            let mi = NSMenuItem(title: text, action: #selector(switchTo(_:)), keyEquivalent: p.n <= 9 ? String(p.n) : "")
             mi.tag = p.n
             mi.target = self
             mi.state = p.active ? .on : .off

@@ -17,6 +17,8 @@ the target profile and relaunches the app.
   claude-profiles profiles <N>        set how many profile slots to show
   claude-profiles import [--dry-run] [--archive-older-than DAYS] [--exclude PATH ...]
                                       add Claude Code CLI / VS Code sessions to the app
+  claude-profiles usage-record        store the active account's plan limits (JSON on stdin,
+                                      as a Claude Code session's get_usage reports them)
   claude-profiles status --json       machine-readable (used by the menu bar app)
   claude-profiles repair              fix directory state after an interrupted switch
 """
@@ -43,6 +45,7 @@ DEFAULT_PROFILES = 2
 RESET = {"remoteMcpServersConfig": [], "enabledMcpTools": {}, "bridgeSessionIds": [],
          "sessionPermissionUpdates": [], "alwaysAllowedReasons": []}
 FIVE_H, SEVEN_D = 5 * 3600, 7 * 86400
+LIMITS = "plan-usage-limits.json"     # our own snapshot of the plan limits, next to the app's history
 TITLE_MAX = 60
 TEMP_PREFIXES = ("/private/tmp/", "/tmp/", "/private/var/folders/", "/var/folders/")   # throwaway sessions
 # a session index entry the app accepts; used when no existing entry can serve as template
@@ -148,20 +151,125 @@ def index_dir(pdir):
     return max(cands, key=lambda c: c[:2])[2] if cands else None
 
 
+def window_key(label):
+    """'5-hour limit' -> five_hour, 'Weekly · all models' -> weekly, 'Weekly · Fable' -> weekly_fable."""
+    slug = lambda s: re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+    low = label.lower()
+    if "5-hour" in low or "five-hour" in low or "5 h" in low:
+        return "five_hour"
+    if low.startswith("weekly"):
+        rest = re.split(r"[·:|]", label, maxsplit=1)
+        rest = rest[1].strip() if len(rest) > 1 else ""
+        return "weekly" if not rest or "all model" in rest.lower() else "weekly_" + slug(rest)
+    return slug(label)
+
+
+def window_period(key):
+    """How long the window lasts – used to roll an expired reset time forward."""
+    return FIVE_H if key == "five_hour" else SEVEN_D if str(key).startswith("weekly") else None
+
+
+def short_name(key, label=""):
+    if key == "five_hour":
+        return "5h"
+    if key == "weekly":
+        return "7d"
+    if key.startswith("weekly_") and "·" in label:
+        return label.split("·")[-1].strip()
+    return label or key
+
+
+def to_ms(v):
+    """ISO timestamp or epoch (s/ms) -> epoch ms."""
+    if isinstance(v, (int, float)):
+        return int(v if v > 1e11 else v * 1000)
+    if not isinstance(v, str):
+        return None
+    try:
+        return int(datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def parse_plan(payload):
+    """Validate the app's plan usage card (as `get_usage` reports it) into a record we can store."""
+    if isinstance(payload, dict) and isinstance(payload.get("plan"), dict):
+        payload = payload["plan"]                      # full get_usage output
+    if not isinstance(payload, dict):
+        raise ValueError("expected a JSON object with a windows list")
+    if payload.get("status") not in (None, "ok"):
+        raise ValueError(f"plan limits are '{payload['status']}' – nothing to record")
+    wins = payload.get("windows")
+    if not isinstance(wins, list) or not wins:
+        raise ValueError("no windows in the plan data")
+    out = []
+    for w in wins:
+        label = str((w or {}).get("label") or "").strip()
+        pct = (w or {}).get("percentUsed")
+        if not label or not isinstance(pct, (int, float)) or isinstance(pct, bool):
+            raise ValueError(f"window without label or percentUsed: {w}")
+        out.append({"key": window_key(label), "label": label,
+                    "percentUsed": int(pct), "resetsAt": to_ms(w.get("resetsAt"))})
+    return {"version": 1, "recordedAt": int(time.time() * 1000), "plan": payload.get("plan"),
+            "windows": out, "extraUsage": payload.get("extraUsage") or {}}
+
+
+def usage_record():
+    """Store the active account's limits (JSON on stdin). The app only persists 5-hour and
+    7-day percentages itself – per-model windows and reset times come from here."""
+    try:
+        payload = json.loads(sys.stdin.read())
+    except json.JSONDecodeError as e:
+        sys.exit(f"usage-record: not valid JSON ({e})")
+    try:
+        rec = parse_plan(payload)
+    except ValueError as e:
+        sys.exit(f"usage-record: {e}")
+    hist = (load_json(LIVE / "plan-usage-history.json", None) or {}).get("samples") or []
+    if hist:
+        rec["org"] = hist[-1].get("org")
+    save_json(LIVE / LIMITS, rec)
+    parts = "  ".join(f"{short_name(w['key'], w['label'])} {w['percentUsed']}%" for w in rec["windows"])
+    print(f"profile {active_profile()}: {parts}")
+
+
 def usage(pdir):
-    """Latest usage sample the app recorded: fh = 5-hour window %, sd = 7-day %."""
-    d = load_json(pdir / "plan-usage-history.json", None)
-    if not d or not d.get("samples"):
-        return {"fh": None, "sd": None, "age": None}
-    s = d["samples"][-1]
-    age = time.time() - s["t"] / 1000
-    u = s.get("u", {})
-    fh, sd = u.get("fh"), u.get("sd")
-    if age > FIVE_H:      # the 5-hour window has certainly reset
-        fh = 0
-    if age > SEVEN_D:
-        sd = 0
-    return {"fh": fh, "sd": sd, "age": int(age)}
+    """What is left of the account's limits: the app's own samples (fh = 5-hour %, sd = 7-day %)
+    merged with our recorded windows, which also know the per-model limits and the reset times.
+    A window whose reset time has passed is empty again, however old the numbers are."""
+    now = time.time()
+    s = ((load_json(pdir / "plan-usage-history.json", None) or {}).get("samples") or [None])[-1]
+    u, h_t = (s or {}).get("u", {}), (s["t"] / 1000 if s else None)
+    rec = load_json(pdir / LIMITS, None)
+    windows, rec_t = [], None
+
+    if rec and isinstance(rec.get("windows"), list):
+        rec_t = (rec.get("recordedAt") or 0) / 1000
+        for w in rec["windows"]:
+            key, period, live = w.get("key"), window_period(w.get("key")), True
+            resets, start = w.get("resetsAt"), None
+            if resets:
+                resets /= 1000
+                while period and resets <= now:        # window ran out -> it is free again
+                    resets, live = resets + period, False
+                start = resets - period if period else None
+                resets = int(resets * 1000)
+            pct, seen = (w.get("percentUsed"), rec_t) if live else (0, None)
+            h_pct = {"five_hour": u.get("fh"), "weekly": u.get("sd")}.get(key)
+            if h_pct is not None and h_t and (seen is None or h_t > seen) and (start is None or h_t >= start):
+                pct = h_pct                            # the app kept counting after we recorded
+            windows.append({"key": key, "label": w.get("label"), "percentUsed": pct, "resetsAt": resets})
+    else:
+        for key, label, pct, period in (("five_hour", "5-hour limit", u.get("fh"), FIVE_H),
+                                        ("weekly", "Weekly · all models", u.get("sd"), SEVEN_D)):
+            if h_t and now - h_t > period:             # the window has certainly reset
+                pct = 0
+            windows.append({"key": key, "label": label, "percentUsed": pct, "resetsAt": None})
+
+    by = {w["key"]: w["percentUsed"] for w in windows}
+    seen = max([t for t in (h_t, rec_t) if t], default=None)
+    return {"fh": by.get("five_hour"), "sd": by.get("weekly"),
+            "age": int(now - seen) if seen else None, "windows": windows}
 
 
 def logged_in(pdir):
@@ -184,7 +292,7 @@ def profiles():
             "exists": exists,
             "logged_in": exists and logged_in(d),
             "sessions": len(list(idx.glob("local_*.json"))) if idx else 0,
-            **(usage(d) if exists else {"fh": None, "sd": None, "age": None}),
+            **(usage(d) if exists else {"fh": None, "sd": None, "age": None, "windows": []}),
         })
     return out
 
@@ -711,6 +819,21 @@ def repair():
             print(f"WARNING: profile {n} is active but {p} also exists – please check manually.")
 
 
+def fmt_reset(ms):
+    """Clock time for today's resets, weekday + time for later ones."""
+    if not ms:
+        return ""
+    t, today = time.localtime(ms / 1000), time.localtime()
+    same_day = (t.tm_year, t.tm_yday) == (today.tm_year, today.tm_yday)
+    return time.strftime("%H:%M" if same_day else "%a %H:%M", t)
+
+
+def fmt_window(w):
+    pct = f"{w['percentUsed']}%" if w["percentUsed"] is not None else "?"
+    reset = fmt_reset(w.get("resetsAt"))
+    return f"{short_name(w['key'], w.get('label') or '')} {pct:>4}" + (f" ↻{reset}" if reset else "")
+
+
 def status(as_json=False):
     ps = profiles()
     if as_json:
@@ -721,9 +844,7 @@ def status(as_json=False):
         if not p["logged_in"]:
             state = "not signed in"
         else:
-            fh = f"{p['fh']}%" if p["fh"] is not None else "?"
-            sd = f"{p['sd']}%" if p["sd"] is not None else "?"
-            state = f"5h {fh:>4}  7d {sd:>4}  {p['sessions']} sessions"
+            state = "   ".join(fmt_window(w) for w in p["windows"]) + f"   {p['sessions']} sessions"
         print(f" {mark} {p['n']}  {p['label']:16} {state}")
 
 
@@ -735,6 +856,8 @@ def main(argv):
         return status(as_json="--json" in args)
     if cmd == "repair":
         return repair()
+    if cmd == "usage-record":
+        return usage_record()
     if cmd == "import":
         return do_import(args)
     if cmd == "add":

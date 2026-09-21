@@ -31,7 +31,7 @@ The app is ad-hoc signed (no Apple developer account involved). If macOS refuses
 
 ## Use
 
-Click the person icon in the menu bar (top right, next to the clock) and pick a profile. The menu shows each profile's usage in the current 5-hour window and the 7-day window; ⌘1–⌘9 switch directly.
+Click the person icon in the menu bar (top right, next to the clock) and pick a profile. The menu shows each profile's usage in the current 5-hour window and the 7-day window — plus every per-model window and the reset times, once you have [recorded them](#plan-limits-in-the-menu). ⌘1–⌘9 switch directly.
 
 **Adding an account:** choose *Add profile…*. Claude relaunches signed out — sign in with the other account and open the *Code* tab once; your sessions are added automatically. From then on the profile stays signed in. Repeat for as many accounts as you have.
 
@@ -56,6 +56,18 @@ claude-profiles import --exclude ~/some/dir      # skip sessions from a director
 ```
 
 Titles come from the first message; sessions whose working directory no longer exists, empty ones, and ones in temp folders are skipped. Running it again adds only new sessions. Restart Claude once if the sidebar does not update.
+
+### Plan limits in the menu
+
+Claude Desktop writes how full the 5-hour and the 7-day window are into `plan-usage-history.json` — but not the per-model windows and not when a window resets. Those numbers exist only inside the app, for the account that is signed in right now. `usage-record` stores them next to the app's own file:
+
+```bash
+claude-profiles usage-record < plan.json   # plan.json: the plan block as get_usage reports it
+```
+
+The simplest way to produce that file is a Claude Code session in the app itself — ask Claude to *"read my plan limits and record them with `claude-profiles usage-record`"*, and it pipes its own usage data in. No token, no network call: the command only reads what you hand it.
+
+A record belongs to its account and travels into the parking lot with it. Percentages go stale, reset times do not: once a window's reset time has passed, the window is empty again, so the menu shows it as free and rolls the reset forward by five hours or a week. While an account is active, the app's own samples keep the 5-hour and 7-day numbers current; the per-model windows keep the recorded value until you record again.
 
 ## How it works
 
