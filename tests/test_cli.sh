@@ -129,4 +129,105 @@ echo "# import-Einträge kommen beim Wechsel mit (Profil 2 wurde oben entfernt -
 "$CLI" 3 >/dev/null
 ls "$LIVE/claude-code-sessions/A3/O3/" | grep -c local_ | grep -q 4 || fail "importierte Sessions nicht synchronisiert"
 ok "import + sync"
+
+# ---------- Limits: 5-Stunden-Fenster, Woche, Fable ----------
+mk_plan() { # <5h%> <5h-Offset-s> <Woche%> <Offset-s> <Fable%> <Offset-s> – wie get_usage sie liefert
+python3 - "$@" <<'PY'
+import json, sys, time, datetime as dt
+a = sys.argv[1:]
+iso = lambda off: dt.datetime.fromtimestamp(time.time() + float(off), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+print(json.dumps({"status": "ok", "plan": "Max", "extraUsage": {"enabled": False, "currency": "USD"}, "windows": [
+    {"label": "5-hour limit", "percentUsed": int(a[0]), "resetsAt": iso(a[1])},
+    {"label": "Weekly · all models", "percentUsed": int(a[2]), "resetsAt": iso(a[3])},
+    {"label": "Weekly · Fable", "percentUsed": int(a[4]), "resetsAt": iso(a[5])}]}))
+PY
+}
+mk_history() { # <Profilordner> <org> <fh> <sd> <Alter-s>
+python3 - "$@" <<'PY'
+import json, sys, time
+d, org, fh, sd, age = sys.argv[1:]
+t = int((time.time() - float(age)) * 1000)
+json.dump({"version": 2, "samples": [{"t": t, "org": org, "u": {"fh": int(fh), "sd": int(sd)}}]},
+          open(d + "/plan-usage-history.json", "w"))
+PY
+}
+age_record() { # <Profilordner> <Alter-s> – Aufzeichnung künstlich altern
+python3 - "$@" <<'PY'
+import json, sys, time
+d, age = sys.argv[1:]
+p = d + "/plan-usage-limits.json"
+r = json.load(open(p)); r["recordedAt"] = int((time.time() - float(age)) * 1000); json.dump(r, open(p, "w"))
+PY
+}
+check() { "$CLI" status --json > "$T/st.json"; python3 - "$T/st.json" || fail "$1"; ok "$1"; }
+
+echo "# usage-record schreibt die vollen Fenster des aktiven Kontos"
+rm -f "$LIVE/plan-usage-history.json"
+mk_plan 12 3600 64 90000 100 90000 | "$CLI" usage-record | grep -qi fable || fail "usage-record meldet nichts"
+[ -f "$LIVE/plan-usage-limits.json" ] || fail "Aufzeichnung nicht geschrieben"
+check "usage-record" <<'PY'
+import json, sys, time
+p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
+w = {x["key"]: x for x in p["windows"]}
+assert set(w) == {"five_hour", "weekly", "weekly_fable"}, w
+assert [w[k]["percentUsed"] for k in ("five_hour", "weekly", "weekly_fable")] == [12, 64, 100], w
+assert abs(w["five_hour"]["resetsAt"] / 1000 - (time.time() + 3600)) < 120, w["five_hour"]
+assert p["fh"] == 12 and p["sd"] == 64, p
+PY
+
+echo "# abgelaufenes Fenster gilt als frei, der Reset rollt weiter"
+mk_history "$LIVE" O3 80 40 21600          # 6 h alt: kein Beleg im laufenden 5-Stunden-Fenster
+mk_plan 100 -7200 64 90000 100 90000 | "$CLI" usage-record >/dev/null
+check "abgelaufenes Fenster" <<'PY'
+import json, sys, time
+p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
+w = {x["key"]: x for x in p["windows"]}
+assert w["five_hour"]["percentUsed"] == 0, w["five_hour"]
+assert abs(w["five_hour"]["resetsAt"] / 1000 - (time.time() + 3 * 3600)) < 120, w["five_hour"]
+assert w["weekly"]["percentUsed"] == 64, "frische Aufzeichnung schlägt 6 h alte Historie"
+PY
+
+echo "# neuere App-Historie schlägt die ältere Aufzeichnung, Fable bleibt aus der Aufzeichnung"
+mk_plan 12 3600 64 90000 100 90000 | "$CLI" usage-record >/dev/null
+age_record "$LIVE" 7200
+mk_history "$LIVE" O3 55 70 60
+check "Historie schlägt alte Aufzeichnung" <<'PY'
+import json, sys
+p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
+w = {x["key"]: x for x in p["windows"]}
+assert [w[k]["percentUsed"] for k in ("five_hour", "weekly", "weekly_fable")] == [55, 70, 100], w
+assert p["fh"] == 55 and p["sd"] == 70, p
+PY
+
+echo "# ohne Aufzeichnung bleibt es beim heutigen Verhalten"
+rm -f "$LIVE/plan-usage-limits.json"
+mk_history "$LIVE" O3 33 44 60
+check "ohne Aufzeichnung" <<'PY'
+import json, sys
+p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
+w = {x["key"]: x for x in p["windows"]}
+assert set(w) == {"five_hour", "weekly"}, w
+assert w["five_hour"]["percentUsed"] == 33 and w["five_hour"]["resetsAt"] is None, w
+assert p["fh"] == 33 and p["sd"] == 44, p
+PY
+
+echo "# Müll wird abgewiesen, ohne etwas zu schreiben"
+echo 'kein json' | "$CLI" usage-record >/dev/null 2>&1 && fail "ungültiges JSON muss scheitern"
+echo '{"status":"unavailable"}' | "$CLI" usage-record >/dev/null 2>&1 && fail "Plan ohne Fenster muss scheitern"
+[ ! -f "$LIVE/plan-usage-limits.json" ] || fail "fehlerhafte Eingabe darf nichts schreiben"
+ok "Eingabeprüfung"
+
+echo "# die Aufzeichnung bleibt beim Konto und wandert beim Wechsel mit"
+mk_plan 7 3600 20 90000 90 90000 | "$CLI" usage-record >/dev/null
+"$CLI" | grep -E '● 3 .*Fable +90%' >/dev/null || fail "Textausgabe zeigt Fable nicht: $("$CLI" | grep '3 ')"
+"$CLI" 1 >/dev/null
+check "Aufzeichnung bleibt beim Konto" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+by = {x["n"]: x for x in d["profiles"]}
+assert d["active"] == 1, d["active"]
+w3 = {x["key"]: x for x in by[3]["windows"]}
+assert w3["weekly_fable"]["percentUsed"] == 90, w3
+assert "weekly_fable" not in {x["key"] for x in by[1]["windows"]}, by[1]["windows"]
+PY
 echo "ALLE TESTS OK"
