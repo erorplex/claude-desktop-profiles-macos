@@ -67,6 +67,8 @@ claude-profiles usage-record < plan.json   # plan.json: the plan block as get_us
 
 The simplest way to produce that file is a Claude Code session in the app itself — ask Claude to *"read my plan limits and record them with `claude-profiles usage-record`"*, and it pipes its own usage data in. No token, no network call: the command only reads what you hand it.
 
+Without a record, the weekly reset is **derived** from the app's own samples: usage only ever grows inside a window, so every drop in the weekly percentage brackets one reset, and brackets from different weeks pin the same recurring instant down. Derived times are marked with a `~` and shown to the day when the brackets are wide (`7d 75% ↻~Sat`). If the samples are too sparse to place the reset within a day, none is shown. The 5-hour window has no derived time on purpose: it only has a reset while it is actually running, which only the signed-in account can know.
+
 A record belongs to its account and travels into the parking lot with it. Percentages go stale, reset times do not: once a window's reset time has passed, the window is empty again, so the menu shows it as free and rolls the reset forward by five hours or a week. While an account is active, the app's own samples keep the 5-hour and 7-day numbers current; the per-model windows keep the recorded value until you record again.
 
 ## How it works

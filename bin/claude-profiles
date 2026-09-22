@@ -22,7 +22,7 @@ the target profile and relaunches the app.
   claude-profiles status --json       machine-readable (used by the menu bar app)
   claude-profiles repair              fix directory state after an interrupted switch
 """
-import hashlib, json, os, re, shutil, subprocess, sys, time, uuid
+import hashlib, json, math, os, re, shutil, subprocess, sys, time, uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -233,13 +233,46 @@ def usage_record():
     print(f"profile {active_profile()}: {parts}")
 
 
+def weekly_reset(samples, now_ms):
+    """When the weekly window resets, read out of the app's own samples. Usage only grows
+    inside a window, so every drop in `sd` brackets one reset; brackets from different weeks
+    pin the same recurring instant down. Returns (epoch ms, uncertainty in hours) or None."""
+    week = SEVEN_D * 1000
+    drops = [(a["t"], b["t"]) for a, b in zip(samples, samples[1:])
+             if a.get("org") == b.get("org")
+             and isinstance((a.get("u") or {}).get("sd"), (int, float))
+             and isinstance((b.get("u") or {}).get("sd"), (int, float))
+             and b["u"]["sd"] < a["u"]["sd"]]
+    if not drops:
+        return None
+    lo, hi = drops[-1]
+    for a, b in drops[-4:-1]:                      # older weeks narrow the bracket
+        k = round((lo - a) / week)
+        nlo, nhi = max(lo, a + k * week), min(hi, b + k * week)
+        if nlo < nhi:
+            lo, hi = nlo, nhi
+    if hi - lo > 24 * 3600 * 1000:                 # too vague to be worth showing
+        return None
+    anchor = (lo + hi) / 2
+    return int(anchor + math.ceil((now_ms - anchor) / week) * week), (hi - lo) / 3600000
+
+
+def estimate(win, guess):
+    """Fill a weekly window that has no recorded reset time with the derived one."""
+    if win["key"] == "weekly" and not win["resetsAt"] and guess:
+        win["resetsAt"], win["estimated"], win["uncertaintyH"] = guess[0], True, round(guess[1], 1)
+    return win
+
+
 def usage(pdir):
     """What is left of the account's limits: the app's own samples (fh = 5-hour %, sd = 7-day %)
     merged with our recorded windows, which also know the per-model limits and the reset times.
     A window whose reset time has passed is empty again, however old the numbers are."""
     now = time.time()
-    s = ((load_json(pdir / "plan-usage-history.json", None) or {}).get("samples") or [None])[-1]
+    samples = (load_json(pdir / "plan-usage-history.json", None) or {}).get("samples") or []
+    s = samples[-1] if samples else None
     u, h_t = (s or {}).get("u", {}), (s["t"] / 1000 if s else None)
+    guess = weekly_reset(samples, now * 1000)
     rec = load_json(pdir / LIMITS, None)
     windows, rec_t = [], None
 
@@ -257,14 +290,17 @@ def usage(pdir):
             pct, seen = (w.get("percentUsed"), rec_t) if live else (0, None)
             h_pct = {"five_hour": u.get("fh"), "weekly": u.get("sd")}.get(key)
             if h_pct is not None and h_t and (seen is None or h_t > seen) and (start is None or h_t >= start):
-                pct = h_pct                            # the app kept counting after we recorded
-            windows.append({"key": key, "label": w.get("label"), "percentUsed": pct, "resetsAt": resets})
+                pct, seen = h_pct, h_t                 # the app kept counting after we recorded
+            if period and seen and now - seen > period:
+                pct = 0                                # nothing seen for a whole window: it has reset since
+            win = {"key": key, "label": w.get("label"), "percentUsed": pct, "resetsAt": resets}
+            windows.append(estimate(win, guess))
     else:
         for key, label, pct, period in (("five_hour", "5-hour limit", u.get("fh"), FIVE_H),
                                         ("weekly", "Weekly · all models", u.get("sd"), SEVEN_D)):
             if h_t and now - h_t > period:             # the window has certainly reset
                 pct = 0
-            windows.append({"key": key, "label": label, "percentUsed": pct, "resetsAt": None})
+            windows.append(estimate({"key": key, "label": label, "percentUsed": pct, "resetsAt": None}, guess))
 
     by = {w["key"]: w["percentUsed"] for w in windows}
     seen = max([t for t in (h_t, rec_t) if t], default=None)
@@ -819,19 +855,24 @@ def repair():
             print(f"WARNING: profile {n} is active but {p} also exists – please check manually.")
 
 
-def fmt_reset(ms):
-    """Clock time for today's resets, weekday + time for later ones."""
+def fmt_reset(ms, coarse=False):
+    """Clock time for today's resets, weekday + time for later ones, the weekday alone
+    when the time itself is only a guess."""
     if not ms:
         return ""
     t, today = time.localtime(ms / 1000), time.localtime()
+    if coarse:
+        return time.strftime("%a", t)
     same_day = (t.tm_year, t.tm_yday) == (today.tm_year, today.tm_yday)
     return time.strftime("%H:%M" if same_day else "%a %H:%M", t)
 
 
 def fmt_window(w):
     pct = f"{w['percentUsed']}%" if w["percentUsed"] is not None else "?"
-    reset = fmt_reset(w.get("resetsAt"))
-    return f"{short_name(w['key'], w.get('label') or '')} {pct:>4}" + (f" ↻{reset}" if reset else "")
+    est = w.get("estimated")
+    reset = fmt_reset(w.get("resetsAt"), coarse=bool(est) and (w.get("uncertaintyH") or 0) > 2)
+    mark = "~" if est else ""
+    return f"{short_name(w['key'], w.get('label') or '')} {pct:>4}" + (f" ↻{mark}{reset}" if reset else "")
 
 
 def status(as_json=False):

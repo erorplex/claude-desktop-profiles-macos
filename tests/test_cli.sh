@@ -230,4 +230,78 @@ w3 = {x["key"]: x for x in by[3]["windows"]}
 assert w3["weekly_fable"]["percentUsed"] == 90, w3
 assert "weekly_fable" not in {x["key"] for x in by[1]["windows"]}, by[1]["windows"]
 PY
+echo "# Wochen-Reset aus der App-Historie ableiten, wenn keine Aufzeichnung da ist"
+mk_weekly_history() { # <Profilordner> <org> <Anker-Offset-h: wann der Wochenreset liegt, relativ zu jetzt-7d> <Bracket-h>
+python3 - "$@" <<'PY2'
+import json, sys, time
+d, org, off, br = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
+now = time.time(); WEEK = 7 * 86400
+anchor = now - WEEK + off * 3600          # letzter Wochenwechsel
+S = lambda t, sd: {"t": int(t * 1000), "org": org, "u": {"fh": 0, "sd": sd}}
+s = [S(anchor - WEEK - br * 1800, 60), S(anchor - WEEK + br * 1800, 5),   # Abfall vor zwei Wochen
+     S(anchor - br * 1800, 70),        S(anchor + br * 1800, 8),          # Abfall vor einer Woche
+     S(now - 600, 40)]
+json.dump({"version": 2, "samples": s}, open(d + "/plan-usage-history.json", "w"))
+PY2
+}
+rm -f "$LIVE/plan-usage-limits.json"
+mk_weekly_history "$LIVE" O1 3 2
+check "Wochen-Reset abgeleitet" <<'PY2'
+import json, sys, time
+p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
+w = {x["key"]: x for x in p["windows"]}
+r = w["weekly"]
+assert r["resetsAt"] is not None, "Wochen-Reset sollte abgeleitet werden"
+assert r.get("estimated") is True, "abgeleitete Zeit muss als Schätzung markiert sein"
+assert abs(r["resetsAt"] / 1000 - (time.time() + 3 * 3600)) < 3600, (r["resetsAt"] / 1000 - time.time()) / 3600
+assert w["five_hour"]["resetsAt"] is None, "ohne laufendes Fenster gibt es keinen 5-Stunden-Reset"
+PY2
+"$CLI" | grep -E '● 1 .*7d .*↻~' >/dev/null || fail "Schätzung muss in der Textausgabe als ~ erkennbar sein"
+
+echo "# zu unscharfe Historie liefert lieber gar keine Zeit"
+mk_weekly_history "$LIVE" O1 3 40
+check "unscharfe Historie" <<'PY2'
+import json, sys
+p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
+w = {x["key"]: x for x in p["windows"]}
+assert w["weekly"]["resetsAt"] is None, w["weekly"]
+PY2
+
+echo "# eine Aufzeichnung schlägt die Schätzung"
+mk_weekly_history "$LIVE" O1 3 2
+mk_plan 12 3600 64 90000 100 90000 | "$CLI" usage-record >/dev/null
+check "Aufzeichnung schlägt Schätzung" <<'PY2'
+import json, sys, time
+p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
+w = {x["key"]: x for x in p["windows"]}
+assert not w["weekly"].get("estimated"), "aufgezeichnete Zeit ist keine Schätzung"
+assert abs(w["weekly"]["resetsAt"] / 1000 - (time.time() + 90000)) < 120, w["weekly"]
+PY2
+echo "# ohne bekannte Reset-Zeit verfällt ein zu alter Wert trotzdem"
+rm -f "$LIVE/plan-usage-limits.json"
+mk_history "$LIVE" O1 90 40 21600          # 6 h alte Stichprobe: das 5-Stunden-Fenster ist längst vorbei
+python3 - "$LIVE" <<'PY2'
+import json, sys, time
+# Aufzeichnung wie get_usage sie bei ruhendem Fenster liefert: Prozent, aber keine Reset-Zeit
+json.dump({"version": 1, "recordedAt": int((time.time() - 25000) * 1000), "plan": "Max", "windows": [
+    {"key": "five_hour", "label": "5-hour limit", "percentUsed": 50, "resetsAt": None},
+    {"key": "weekly", "label": "Weekly · all models", "percentUsed": 40,
+     "resetsAt": int((time.time() + 90000) * 1000)}], "extraUsage": {}},
+    open(sys.argv[1] + "/plan-usage-limits.json", "w"))
+PY2
+check "alter Wert ohne Reset-Zeit verfaellt" <<'PY2'
+import json, sys
+p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
+w = {x["key"]: x for x in p["windows"]}
+assert w["five_hour"]["percentUsed"] == 0, w["five_hour"]
+assert w["weekly"]["percentUsed"] == 40, "die Woche laeuft noch, der Wert bleibt"
+PY2
+
+echo "# frische Stichprobe im laufenden Fenster bleibt stehen"
+mk_history "$LIVE" O1 90 40 600
+check "frische Stichprobe bleibt" <<'PY2'
+import json, sys
+p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
+assert {x["key"]: x for x in p["windows"]}["five_hour"]["percentUsed"] == 90
+PY2
 echo "ALLE TESTS OK"

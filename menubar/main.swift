@@ -6,6 +6,7 @@ let cli = NSHomeDirectory() + "/.local/bin/claude-profiles"
 
 struct Window: Decodable {
     let key: String; let label: String?; let percentUsed: Int?; let resetsAt: Double?
+    let estimated: Bool?; let uncertaintyH: Double?
 
     var short: String {                     // five_hour -> "5 h", weekly_fable -> "Fable"
         switch key {
@@ -19,13 +20,15 @@ struct Window: Decodable {
         }
     }
     var used: String { percentUsed.map { "\($0) %" } ?? "–" }
-    var reset: String? {                    // clock time today, weekday + time later on
-        guard let ms = resetsAt else { return nil }
+    var reset: String? {                    // clock time today, weekday + time later on,
+        guard let ms = resetsAt else { return nil }   // the weekday alone when it is only a guess
         let d = Date(timeIntervalSince1970: ms / 1000)
+        let guessed = estimated == true
+        let coarse = guessed && (uncertaintyH ?? 0) > 2
         let f = DateFormatter()
         f.locale = Locale.current
-        f.dateFormat = Calendar.current.isDateInToday(d) ? "HH:mm" : "EEE HH:mm"
-        return f.string(from: d)
+        f.dateFormat = coarse ? "EEE" : (Calendar.current.isDateInToday(d) ? "HH:mm" : "EEE HH:mm")
+        return (guessed ? "~" : "") + f.string(from: d)
     }
 }
 struct Profile: Decodable {
@@ -94,8 +97,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func limitsTitle(_ p: Profile) -> NSAttributedString {
         var windows = p.windows ?? []
         if windows.isEmpty {        // older CLI without recorded windows
-            windows = [Window(key: "five_hour", label: nil, percentUsed: p.fh, resetsAt: nil),
-                       Window(key: "weekly", label: nil, percentUsed: p.sd, resetsAt: nil)]
+            windows = [Window(key: "five_hour", label: nil, percentUsed: p.fh, resetsAt: nil,
+                              estimated: nil, uncertaintyH: nil),
+                       Window(key: "weekly", label: nil, percentUsed: p.sd, resetsAt: nil,
+                              estimated: nil, uncertaintyH: nil)]
         }
         let used = windows.map { "\($0.short) \($0.used)" }.joined(separator: "   ")
         let resets = windows.compactMap { w in w.reset.map { "\(w.short) \($0)" } }
