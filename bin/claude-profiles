@@ -46,6 +46,7 @@ RESET = {"remoteMcpServersConfig": [], "enabledMcpTools": {}, "bridgeSessionIds"
          "sessionPermissionUpdates": [], "alwaysAllowedReasons": []}
 FIVE_H, SEVEN_D = 5 * 3600, 7 * 86400
 LIMITS = "plan-usage-limits.json"     # our own snapshot of the plan limits, next to the app's history
+AUTO_RESUME = "autoResumeRateLimit."   # + account id, in preferences.epitaxyPrefs of claude_desktop_config.json
 TITLE_MAX = 60
 TEMP_PREFIXES = ("/private/tmp/", "/tmp/", "/private/var/folders/", "/var/folders/")   # throwaway sessions
 # a session index entry the app accepts; used when no existing entry can serve as template
@@ -257,6 +258,23 @@ def weekly_reset(samples, now_ms):
     return int(anchor + math.ceil((now_ms - anchor) / week) * week), (hi - lo) / 3600000
 
 
+def rate_limit_resets():
+    """When a session runs into a limit, the app notes the reset time to resume it automatically:
+    epitaxyPrefs["autoResumeRateLimit.<account>"] = {session: {"resetsAt": epoch s}}. The config file
+    travels between profiles, so any of them may hold another account's entry. -> {account: epoch ms}"""
+    out = {}
+    for f in [LIVE / "claude_desktop_config.json", *PROFILES.glob("*/claude_desktop_config.json")]:
+        prefs = ((load_json(f, {}) or {}).get("preferences") or {}).get("epitaxyPrefs") or {}
+        for k, v in prefs.items():
+            if not (k.startswith(AUTO_RESUME) and isinstance(v, dict)):
+                continue
+            for e in v.values():
+                ms = to_ms(e.get("resetsAt")) if isinstance(e, dict) else None
+                if ms and ms > out.get(k[len(AUTO_RESUME):], 0):
+                    out[k[len(AUTO_RESUME):]] = ms
+    return out
+
+
 def estimate(win, guess):
     """Fill a weekly window that has no recorded reset time with the derived one."""
     if win["key"] == "weekly" and not win["resetsAt"] and guess:
@@ -264,7 +282,7 @@ def estimate(win, guess):
     return win
 
 
-def usage(pdir):
+def usage(pdir, blocked=None):
     """What is left of the account's limits: the app's own samples (fh = 5-hour %, sd = 7-day %)
     merged with our recorded windows, which also know the per-model limits and the reset times.
     A window whose reset time has passed is empty again, however old the numbers are."""
@@ -302,6 +320,10 @@ def usage(pdir):
                 pct = 0
             windows.append(estimate({"key": key, "label": label, "percentUsed": pct, "resetsAt": None}, guess))
 
+    if blocked and now * 1000 < blocked <= (now + FIVE_H) * 1000:
+        for w in windows:                              # a session ran into the limit: the app knows until when
+            if w["key"] == "five_hour" and not w["resetsAt"] and w["percentUsed"]:
+                w["resetsAt"] = blocked
     by = {w["key"]: w["percentUsed"] for w in windows}
     seen = max([t for t in (h_t, rec_t) if t], default=None)
     return {"fh": by.get("five_hour"), "sd": by.get("weekly"),
@@ -316,6 +338,7 @@ def logged_in(pdir):
 def profiles():
     cfg = config()
     act = active_profile()
+    blocked = rate_limit_resets()
     out = []
     for n in range(1, n_profiles() + 1):
         d = profile_dir(n)
@@ -328,7 +351,8 @@ def profiles():
             "exists": exists,
             "logged_in": exists and logged_in(d),
             "sessions": len(list(idx.glob("local_*.json"))) if idx else 0,
-            **(usage(d) if exists else {"fh": None, "sd": None, "age": None, "windows": []}),
+            **(usage(d, blocked.get(idx.parent.name) if idx else None) if exists
+               else {"fh": None, "sd": None, "age": None, "windows": []}),
         })
     return out
 
@@ -368,6 +392,9 @@ def all_profile_dirs():
 SNAPSHOT = PROFILES / "shared" / "sessions-snapshot.json"
 MONOTONIC = {"lastActivityAt", "lastFocusedAt", "completedTurns"}      # never taken backwards
 GROUP_SCOPES = "dframe-group-scopes"          # preferences.epitaxyPrefs[...] in claude_desktop_config.json
+ROUTINES = "scheduled-tasks.json"             # the app registers routines per account, next to the session index
+ROUTINES_SNAPSHOT = PROFILES / "shared" / "routines-snapshot.json"
+RUN_STATE = ("lastRunAt", "lastScheduledFor", "missedRunScanFloor")   # newest wins, or a slot runs twice
 _MISSING = object()
 
 
@@ -458,8 +485,52 @@ def sync_sessions(target_n, source_n, dirs):
     save_json(SNAPSHOT, {"target": target_n, "sessions": fps})
     write_archive_index(target_idx, archived, all_sids)
     log(f"sessions -> profile {target_n}: {written} updated, {len(all_sids)} total")
+    sync_routines(target_n, source_n, dirs)
     sync_config(target_n, source_n, dirs, trusted)
     return True
+
+
+def sync_routines(target_n, source_n, dirs):
+    """Routines (scheduled tasks) are registered per account in <index>/scheduled-tasks.json, while their
+    prompts live in the shared ~/.claude/scheduled-tasks. Treat them like sessions: every profile gets every
+    routine, the profile just left decides the definition, the newest run state wins everywhere (so a slot
+    that already ran is not caught up again after the switch), and a routine deleted in the profile just
+    left is removed from all profiles at once."""
+    files = {n: index_dir(d) / ROUTINES for n, d in dirs.items() if index_dir(d)}
+    if target_n not in files:
+        return
+    data = {n: load_json(f, None) for n, f in files.items()}
+    tasks = {n: {x["id"]: x for x in (d or {}).get("scheduledTasks", []) if isinstance(x, dict) and x.get("id")}
+             for n, d in data.items()}
+    snap = load_json(ROUTINES_SNAPSHOT, {})
+    known = set(snap.get("ids", [])) if snap.get("target") == source_n else set()
+    gone = known - set(tasks.get(source_n, {})) if source_n in tasks else set()
+    for n in tasks:
+        dropped = gone & set(tasks[n])
+        for rid in dropped:
+            del tasks[n][rid]
+            log(f"routine {rid} removed from profile {n} (deleted in profile {source_n})")
+        if dropped and n != target_n:                  # the target is written below anyway
+            save_json(files[n], {**data[n], "scheduledTasks": list(tasks[n].values())})
+
+    merged = {}
+    for rid in sorted({rid for ts in tasks.values() for rid in ts}):
+        copies = [ts[rid] for ts in tasks.values() if rid in ts]
+        own = tasks.get(source_n, {}).get(rid) or max(copies, key=lambda c: to_ms(c.get("lastRunAt")) or 0)
+        entry = dict(own)
+        for k in RUN_STATE:
+            vals = [c[k] for c in copies if to_ms(c.get(k))]
+            if vals:
+                entry[k] = max(vals, key=to_ms)
+        merged[rid] = entry
+
+    base = {**(data.get(source_n) or {}), **(data.get(target_n) or {})}      # the target keeps its bookkeeping
+    out = {**base, "scheduledTasks": sorted(merged.values(), key=lambda x: (x.get("createdAt") or 0, x["id"]))}
+    if merged or data.get(target_n):
+        if out != data.get(target_n):
+            save_json(files[target_n], out)
+            log(f"routines -> profile {target_n}: {len(merged)} ({', '.join(merged) or 'none'})")
+    save_json(ROUTINES_SNAPSHOT, {"target": target_n, "ids": sorted(merged)})
 
 
 def write_archive_index(idx, archived, known):

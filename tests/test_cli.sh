@@ -304,4 +304,39 @@ import json, sys
 p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
 assert {x["key"]: x for x in p["windows"]}["five_hour"]["percentUsed"] == 90
 PY2
+echo "# Limit-Sperre aus der Auto-Fortsetzung liefert den exakten 5-Stunden-Reset"
+set_resume() { # <Profilordner> <Konto> <Offset-s> – so legt die App es beim Limit-Treffer ab
+python3 - "$@" <<'PY2'
+import json, os, sys, time
+d, acct, off = sys.argv[1], sys.argv[2], float(sys.argv[3])
+p = d + "/claude_desktop_config.json"
+c = json.load(open(p)) if os.path.exists(p) else {}
+prefs = c.setdefault("preferences", {}).setdefault("epitaxyPrefs", {})
+prefs["autoResumeRateLimit." + acct] = {"local_x": {"resetsAt": int(time.time() + off), "attempt": 0, "optedIn": True}}
+json.dump(c, open(p, "w"))
+PY2
+}
+five_reset() { # erwartete Reset-Zeit in Sekunden ab jetzt, oder "none"
+"$CLI" status --json > "$T/st.json"
+python3 - "$T/st.json" "$1" <<'PY2'
+import json, sys, time
+p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
+r = {x["key"]: x for x in p["windows"]}["five_hour"]["resetsAt"]
+if sys.argv[2] == "none":
+    assert r is None, (r / 1000 - time.time()) / 3600
+else:
+    assert r is not None and abs(r / 1000 - (time.time() + float(sys.argv[2]))) < 120, r
+PY2
+}
+rm -f "$LIVE/plan-usage-limits.json"
+mk_history "$LIVE" O1 100 40 600
+set_resume "$P/3" A1 7200               # liegt in der Konfig eines geparkten Profils – die Konfig wandert mit
+set_resume "$LIVE" A3 3600              # Eintrag eines anderen Kontos darf nicht abfärben
+five_reset 7200 || fail "Sperre muss den 5h-Reset liefern"; ok "Sperre liefert 5h-Reset"
+set_resume "$P/3" A1 -60
+five_reset none || fail "abgelaufene Sperre ignorieren"; ok "abgelaufene Sperre ignoriert"
+set_resume "$P/3" A1 259200
+five_reset none || fail "Sperre in 3 Tagen ist kein 5-Stunden-Limit"; ok "ferne Sperre ist kein 5h-Reset"
+set_resume "$P/3" A1 7200; mk_history "$LIVE" O1 0 40 600
+five_reset none || fail "ruhendes Fenster bekommt keinen Reset"; ok "ruhendes Fenster ohne Reset"
 echo "ALLE TESTS OK"
