@@ -69,6 +69,8 @@ The simplest way to produce that file is a Claude Code session in the app itself
 
 Without a record, the weekly reset is **derived** from the app's own samples: usage only ever grows inside a window, so every drop in the weekly percentage brackets one reset, and brackets from different weeks pin the same recurring instant down. Derived times are marked with a `~` and shown to the day when the brackets are wide (`7d 75% ↻~Sat`). If the samples are too sparse to place the reset within a day, none is shown. The 5-hour window has no derived time on purpose: it only has a reset while it is actually running, which only the signed-in account can know.
 
+When a session runs into a limit, the app notes the exact reset time so it can resume the session later (`autoResumeRateLimit.<account>` in `claude_desktop_config.json`). The switcher reads that too: an account that is blocked shows *when* its 5-hour window frees up, even if no recording could be made — which is exactly the moment a recording session cannot start.
+
 A record belongs to its account and travels into the parking lot with it. Percentages go stale, reset times do not: once a window's reset time has passed, the window is empty again, so the menu shows it as free and rolls the reset forward by five hours or a week. While an account is active, the app's own samples keep the 5-hour and 7-day numbers current; the per-model windows keep the recorded value until you record again.
 
 ## How it works
@@ -92,8 +94,11 @@ Only one profile is in use between two switches, so whatever differs there from 
 | Archived / restored | `archived-sessions.idx` plus `isArchived` per entry |
 | Which session sits in which sidebar group | `claude_desktop_config.json` → `preferences.epitaxyPrefs.dframe-group-scopes` |
 | Local MCP servers, pins | `claude_desktop_config.json` |
+| Routines (scheduled tasks) | `claude-code-sessions/<account>/<org>/scheduled-tasks.json` |
 
 Groups are matched by **name**, since each account has its own group ids.
+
+Routines keep their prompts in `~/.claude/scheduled-tasks`, which every profile shares anyway — but the app registers the *schedule* per account. A switch carries every registration into the target, with the newest run state, so a slot that already ran in one account is not caught up again in the next. A routine deleted in the profile you just left is removed from all profiles at once.
 
 ## Caveats
 

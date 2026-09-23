@@ -84,6 +84,19 @@ class Rig:
         c = json.loads((self.pdir(n) / "claude_desktop_config.json").read_text())
         return c["preferences"]["epitaxyPrefs"].get("dframe-group-scopes", {}).get(f"{a}/{o}")
 
+    def set_routines(self, tasks, **extra):
+        """Wie die App: Routine-Registrierungen des aktiven Kontos (Zeitplan liegt je Konto im Sitzungsordner)."""
+        n = self.active()
+        (self.idx(n) / "scheduled-tasks.json").write_text(json.dumps({"scheduledTasks": tasks, **extra}))
+
+    def routines(self, n):
+        p = self.idx(n) / "scheduled-tasks.json"
+        return json.loads(p.read_text()) if p.exists() else None
+
+    def routine_ids(self, n):
+        d = self.routines(n)
+        return {t["id"] for t in (d or {}).get("scheduledTasks", [])}
+
     def switch(self, n):
         r = subprocess.run([sys.executable, SCRIPT, str(n)], env=self.env, capture_output=True, text=True)
         log = (self.root / "switch.log").read_text() if (self.root / "switch.log").exists() else ""
@@ -230,6 +243,62 @@ class SwitchTests(unittest.TestCase):
         self.r.switch(3)
         self.assertEqual([x["name"] for x in self.r.groups(3)["groups"]], ["Timekom"])
 
+
+
+    # ---------- Routinen: der Zeitplan liegt je Konto, soll aber in allen Konten laufen ----------
+
+    def routine(self, rid="limits", **kw):
+        return {"id": rid, "displayName": rid, "cronExpression": "0 8,12,16,20 * * *", "enabled": True,
+                "filePath": f"/home/.claude/scheduled-tasks/{rid}/SKILL.md", "cwd": "/home", "createdAt": 1,
+                "lastRunAt": "2026-09-22T06:00:05.000Z", "lastScheduledFor": "2026-09-22T06:00:00.000Z",
+                "missedRunScanFloor": "2026-09-21T19:00:00.000Z", **kw}
+
+    def test_routine_folgt_ins_zielkonto(self):
+        self.r.set_routines([self.routine()], recordedSkips={}, sundayAliasBoundaryStamped=True)
+        self.r.switch(2)
+        d = self.r.routines(2)
+        self.assertEqual([t["id"] for t in d["scheduledTasks"]], ["limits"])
+        self.assertEqual(d["scheduledTasks"][0]["cronExpression"], "0 8,12,16,20 * * *")
+
+    def test_laufstand_und_aenderung_wandern_zurueck(self):
+        self.r.set_routines([self.routine()])
+        self.r.switch(2)
+        # in Konto 2 laeuft die Routine weiter und bekommt einen neuen Zeitplan
+        self.r.set_routines([self.routine(cronExpression="0 * * * *", lastRunAt="2026-09-22T10:00:04.000Z",
+                                            lastScheduledFor="2026-09-22T10:00:00.000Z")])
+        self.r.switch(1)
+        t = self.r.routines(1)["scheduledTasks"][0]
+        self.assertEqual(t["cronExpression"], "0 * * * *")
+        self.assertEqual(t["lastScheduledFor"], "2026-09-22T10:00:00.000Z", "sonst holt Konto 1 den Lauf nach")
+
+    def test_neuerer_laufstand_im_ziel_geht_nicht_verloren(self):
+        self.r.set_routines([self.routine()])
+        self.r.switch(2)
+        self.r.switch(3)
+        # Konto 1 liegt geparkt mit altem Stand; Konto 3 hat inzwischen weiter laufen lassen
+        self.r.set_routines([self.routine(lastScheduledFor="2026-09-22T18:00:00.000Z")])
+        self.r.switch(1)
+        self.assertEqual(self.r.routines(1)["scheduledTasks"][0]["lastScheduledFor"], "2026-09-22T18:00:00.000Z")
+
+    def test_geloeschte_routine_verschwindet_ueberall(self):
+        self.r.set_routines([self.routine(), self.routine("andere")])
+        self.r.switch(2)
+        self.r.set_routines([self.routine("andere")])          # in Konto 2 geloescht
+        self.r.switch(3)
+        self.assertEqual(self.r.routine_ids(3), {"andere"})
+        self.assertEqual(self.r.routine_ids(1), {"andere"}, "auch das geparkte Konto 1 verliert sie sofort")
+
+    def test_eigene_routine_eines_kontos_bleibt_beim_ersten_abgleich(self):
+        a, o = ACCT[2]
+        p = self.r.sup / "Claude-profiles" / "2" / "claude-code-sessions" / a / o / "scheduled-tasks.json"
+        p.write_text(json.dumps({"scheduledTasks": [self.routine("nur-in-2")], "recordedSkips": {"x": 1}}))
+        self.r.set_routines([self.routine()])
+        self.r.switch(2)
+        d = self.r.routines(2)
+        self.assertEqual({t["id"] for t in d["scheduledTasks"]}, {"limits", "nur-in-2"})
+        self.assertEqual(d["recordedSkips"], {"x": 1}, "Buchhaltung des Zielkontos bleibt")
+        self.r.switch(1)
+        self.assertEqual(self.r.routine_ids(1), {"limits", "nur-in-2"})
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
