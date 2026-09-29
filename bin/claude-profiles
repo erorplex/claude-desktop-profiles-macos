@@ -4,8 +4,8 @@
 The active profile always lives in the real data directory
 (~/Library/Application Support/Claude); every other profile is parked under
 ~/Library/Application Support/Claude-profiles/<N>. Switching quits the app,
-renames the two directories (atomic, sub-second), syncs Code-tab sessions into
-the target profile and relaunches the app.
+syncs Code-tab sessions into the parked target, renames the two directories
+(each rename is atomic, sub-second), and relaunches the app.
 
   claude-profiles                     status: profiles, active one, usage
   claude-profiles <N|label>           switch (relaunches the app)
@@ -22,8 +22,9 @@ the target profile and relaunches the app.
   claude-profiles status --json       machine-readable (used by the menu bar app)
   claude-profiles repair              fix directory state after an interrupted switch
 """
-import hashlib, json, math, os, re, shutil, subprocess, sys, time, uuid
+import fcntl, hashlib, json, math, os, re, shutil, subprocess, sys, tempfile, time, uuid
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -77,15 +78,106 @@ def load_json(p, default):
         return default
 
 
+def read_object(p, default=None):
+    """Only an absent file is optional. Never treat unreadable data as an empty index."""
+    try:
+        text = Path(p).read_text()
+    except FileNotFoundError:
+        return default
+    except (OSError, UnicodeError) as e:
+        raise ValueError(f"Cannot read {p}; no data was discarded") from e
+    try:
+        data = json.loads(text)
+    except (ValueError, UnicodeError) as e:
+        raise ValueError(f"Invalid JSON in {p}; repair or restore this file before switching") from e
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a JSON object in {p}")
+    return data
+
+
+def atomic_write(p, data):
+    """Replace a complete file; a failed write must not truncate its previous contents."""
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            if p.exists():
+                os.fchmod(f.fileno(), p.stat().st_mode & 0o777)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(p)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def save_json(p, data):
-    Path(p).parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(p) + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    tmp.replace(p)
+    atomic_write(p, json.dumps(data, indent=2, ensure_ascii=False).encode())
+
+
+class RecoveryRequired(RuntimeError):
+    """Restoration failed; do not write more files or launch the app."""
+
+
+class SyncPlan:
+    """Prepare all JSON before writing. Roll back catchable write/activation failures."""
+    def __init__(self):
+        self.writes = {}
+
+    def add(self, p, data):
+        self.writes[Path(p)] = json.dumps(data, indent=2, ensure_ascii=False).encode()
+
+    @contextmanager
+    def apply(self):
+        before = {}
+        for p in self.writes:
+            if p.exists():
+                before[p] = (p.read_bytes(), p.stat())
+            else:
+                before[p] = None
+        written = []
+        try:
+            for p, data in self.writes.items():
+                atomic_write(p, data)
+                written.append(p)
+            yield
+        except RecoveryRequired:
+            raise
+        except Exception:
+            failed = []
+            for p in reversed(written):
+                try:
+                    old = before[p]
+                    if old is None:
+                        p.unlink(missing_ok=True)
+                    else:
+                        atomic_write(p, old[0])
+                        os.utime(p, ns=(old[1].st_atime_ns, old[1].st_mtime_ns))
+                except OSError:
+                    failed.append(str(p))
+            if failed:
+                raise RecoveryRequired("Rollback incomplete; inspect these files before retrying: " + ", ".join(failed))
+            raise
+
+
+@contextmanager
+def switch_lock():
+    PROFILES.mkdir(parents=True, exist_ok=True)
+    with (PROFILES / "switch.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Another profile switch is in progress; wait for it to finish")
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def config():
-    c = load_json(CONFIG, {})
+    c = read_object(CONFIG, {})
     c.setdefault("labels", {})
     c.setdefault("profiles", DEFAULT_PROFILES)
     return c
@@ -102,11 +194,11 @@ def osascript(script):
 
 
 def notify(text):
-    osascript(f'display notification "{text}" with title "Claude Profiles"')
+    osascript(f'display notification {json.dumps(text, ensure_ascii=False)} with title "Claude Profiles"')
 
 
 def dialog(text):
-    osascript(f'display dialog "{text}" with title "Claude Profiles" buttons {{"OK"}} with icon caution')
+    osascript(f'display dialog {json.dumps(text, ensure_ascii=False)} with title "Claude Profiles" buttons {{"OK"}} with icon caution')
 
 
 # ---------- profiles ----------
@@ -140,7 +232,7 @@ def index_dir(pdir):
     base = pdir / "claude-code-sessions"
     if not base.is_dir():
         return None
-    known = load_json(pdir / "config.json", {}).get("lastKnownAccountUuid")
+    known = read_object(pdir / "config.json", {}).get("lastKnownAccountUuid")
     cands = []
     for a in base.iterdir():
         if not a.is_dir():
@@ -374,9 +466,10 @@ def sessions_in(pdir):
         return None
     out = {}
     for f in idx.glob("local_*.json"):
-        d = load_json(f, None)
-        if isinstance(d, dict) and d.get("sessionId"):
-            out[d["sessionId"]] = (f, d)
+        d = read_object(f)
+        if d is None or d.get("sessionId") != f.stem:
+            raise ValueError(f"Session identity does not match its filename: {f}")
+        out[d["sessionId"]] = (f, d)
     return out
 
 
@@ -430,34 +523,21 @@ def merge_session(copies, source_n, base):
     return merged
 
 
-def sync_sessions(target_n, source_n, dirs):
-    """Bring every profile's sessions into the target profile (three-way, see merge_session).
-    Deletions: a session the manifest lists for the profile we just left, but which is gone
-    there, was deleted by the user -> remove it everywhere."""
+def plan_sync(target_n, source_n, dirs):
+    """Prepare a three-way merge without writing. Missing cards are never deletion evidence."""
+    per_profile = {n: sessions_in(d) for n, d in dirs.items()}
+    per_profile = {n: s for n, s in per_profile.items() if s is not None}
     target_idx = index_dir(dirs[target_n])
     if not target_idx:
         log(f"profile {target_n}: no session index yet (sign in and open the Code tab) – syncing later")
-        return False
-    manifest = load_json(MANIFEST, {})
-    snap = load_json(SNAPSHOT, {})
+        return None
+    plan = SyncPlan()
+    manifest = read_object(MANIFEST, {})
+    snap = read_object(SNAPSHOT, {})
     trusted = snap.get("target") == source_n
     bases = snap.get("sessions", {}) if trusted else {}
     if not trusted:
         log(f"no trusted snapshot for profile {source_n} – majority decides this time")
-    per_profile = {n: sessions_in(d) for n, d in dirs.items()}
-    per_profile = {n: s for n, s in per_profile.items() if s is not None}
-
-    src = per_profile.get(source_n)
-    if src is not None:
-        for sid, m in list(manifest.items()):
-            if source_n in m.get("profiles", []) and sid not in src:
-                for n, sess in per_profile.items():
-                    if sid in sess:
-                        sess[sid][0].unlink(missing_ok=True)
-                        del sess[sid]
-                        log(f"session {sid} removed from profile {n} (deleted in profile {source_n})")
-                del manifest[sid]
-
     for n, sess in per_profile.items():
         for sid in sess:
             m = manifest.setdefault(sid, {"profiles": []})
@@ -477,20 +557,20 @@ def sync_sessions(target_n, source_n, dirs):
         if sid in tgt and tgt[sid][1] == out:
             continue
         name = next(sess[sid][0].name for sess in per_profile.values() if sid in sess)
-        (target_idx / name).write_text(json.dumps(out))
+        plan.add(target_idx / name, out)
         written += 1
         if target_n not in manifest[sid]["profiles"]:
             manifest[sid]["profiles"].append(target_n)
-    save_json(MANIFEST, manifest)
-    save_json(SNAPSHOT, {"target": target_n, "sessions": fps})
-    write_archive_index(target_idx, archived, all_sids)
-    log(f"sessions -> profile {target_n}: {written} updated, {len(all_sids)} total")
-    sync_routines(target_n, source_n, dirs)
-    sync_config(target_n, source_n, dirs, trusted)
-    return True
+    plan.add(MANIFEST, manifest)
+    plan.add(SNAPSHOT, {"target": target_n, "sessions": fps})
+    write_archive_index(target_idx, archived, all_sids, plan)
+    log(f"prepared sessions -> profile {target_n}: {written} updates, {len(all_sids)} total")
+    sync_routines(target_n, source_n, dirs, plan)
+    sync_config(target_n, source_n, dirs, trusted, plan)
+    return plan
 
 
-def sync_routines(target_n, source_n, dirs):
+def sync_routines(target_n, source_n, dirs, plan):
     """Routines (scheduled tasks) are registered per account in <index>/scheduled-tasks.json, while their
     prompts live in the shared ~/.claude/scheduled-tasks. Treat them like sessions: every profile gets every
     routine, the profile just left decides the definition, the newest run state wins everywhere (so a slot
@@ -499,19 +579,26 @@ def sync_routines(target_n, source_n, dirs):
     files = {n: index_dir(d) / ROUTINES for n, d in dirs.items() if index_dir(d)}
     if target_n not in files:
         return
-    data = {n: load_json(f, None) for n, f in files.items()}
+    data = {n: read_object(f) for n, f in files.items()}
+    for n, d in data.items():
+        entries = (d or {}).get("scheduledTasks", [])
+        if (not isinstance(entries, list) or any(not isinstance(x, dict) or not isinstance(x.get("id"), str)
+                                                 or not x["id"] for x in entries)):
+            raise ValueError(f"Invalid scheduledTasks in {files[n]}")
+        if len({x["id"] for x in entries}) != len(entries):
+            raise ValueError(f"Duplicate scheduled task IDs in {files[n]}")
     tasks = {n: {x["id"]: x for x in (d or {}).get("scheduledTasks", []) if isinstance(x, dict) and x.get("id")}
              for n, d in data.items()}
-    snap = load_json(ROUTINES_SNAPSHOT, {})
+    snap = read_object(ROUTINES_SNAPSHOT, {})
     known = set(snap.get("ids", [])) if snap.get("target") == source_n else set()
-    gone = known - set(tasks.get(source_n, {})) if source_n in tasks else set()
+    gone = known - set(tasks.get(source_n, {})) if data.get(source_n) is not None else set()
     for n in tasks:
         dropped = gone & set(tasks[n])
         for rid in dropped:
             del tasks[n][rid]
             log(f"routine {rid} removed from profile {n} (deleted in profile {source_n})")
         if dropped and n != target_n:                  # the target is written below anyway
-            save_json(files[n], {**data[n], "scheduledTasks": list(tasks[n].values())})
+            plan.add(files[n], {**data[n], "scheduledTasks": list(tasks[n].values())})
 
     merged = {}
     for rid in sorted({rid for ts in tasks.values() for rid in ts}):
@@ -528,19 +615,21 @@ def sync_routines(target_n, source_n, dirs):
     out = {**base, "scheduledTasks": sorted(merged.values(), key=lambda x: (x.get("createdAt") or 0, x["id"]))}
     if merged or data.get(target_n):
         if out != data.get(target_n):
-            save_json(files[target_n], out)
+            plan.add(files[target_n], out)
             log(f"routines -> profile {target_n}: {len(merged)} ({', '.join(merged) or 'none'})")
-    save_json(ROUTINES_SNAPSHOT, {"target": target_n, "ids": sorted(merged)})
+    plan.add(ROUTINES_SNAPSHOT, {"target": target_n, "ids": sorted(merged)})
 
 
-def write_archive_index(idx, archived, known):
+def write_archive_index(idx, archived, known, plan):
     """The app keeps archiving twice: isArchived per entry and archived-sessions.idx - keep both in step."""
     p = idx / "archived-sessions.idx"
-    cur = load_json(p, {}) or {}
-    have = cur.get("archived", []) if isinstance(cur.get("archived"), list) else []
+    cur = read_object(p, {})
+    have = cur.get("archived", [])
+    if not isinstance(have, list) or any(not isinstance(s, str) for s in have):
+        raise ValueError(f"Invalid archived session list in {p}")
     want = sorted(archived | {s for s in have if s not in known})
     if sorted(have) != want:
-        p.write_text(json.dumps({"v": cur.get("v", 1), "archived": want}))
+        plan.add(p, {"v": cur.get("v", 1), "archived": want})
 
 
 def scope_of(pdir):
@@ -551,10 +640,12 @@ def scope_of(pdir):
 def group_entry(pdir):
     """(scope, {groups, assignments, order}) the app stores for this profile's own account, or (scope, None)."""
     scope = scope_of(pdir)
-    cfg = load_json(pdir / "claude_desktop_config.json", {})
+    cfg = read_object(pdir / "claude_desktop_config.json", {})
     scopes = cfg.get("preferences", {}).get("epitaxyPrefs", {}).get(GROUP_SCOPES, {})
     e = scopes.get(scope) if scope else None
-    return scope, (e if isinstance(e, dict) and isinstance(e.get("groups"), list) else None)
+    if e is not None and (not isinstance(e, dict) or not isinstance(e.get("groups"), list)):
+        raise ValueError(f"Invalid sidebar groups in {pdir / 'claude_desktop_config.json'}")
+    return scope, e
 
 
 def merge_groups(target, source):
@@ -570,7 +661,7 @@ def merge_groups(target, source):
     }
 
 
-def sync_config(target_n, source_n, dirs, trusted):
+def sync_config(target_n, source_n, dirs, trusted, plan):
     """Local MCP servers are not account-bound: the newest claude_desktop_config.json wins. The same file
     carries the Code-tab sidebar groups keyed by <account>/<org>, so those are re-keyed to the target's
     scope instead of copied - and they follow the profile just left, whichever config file is newer."""
@@ -578,16 +669,13 @@ def sync_config(target_n, source_n, dirs, trusted):
     tgt_cfg = tgt_dir / "claude_desktop_config.json"
     tgt_scope, tgt_entry = group_entry(tgt_dir)                  # read before anything is copied over
     src_entry = group_entry(dirs[source_n])[1] if source_n in dirs else None
-    base, origin = load_json(tgt_cfg, None), None
+    base, origin = read_object(tgt_cfg), None
     cfgs = [(d / "claude_desktop_config.json") for d in dirs.values() if (d / "claude_desktop_config.json").exists()]
+    configs = {p: read_object(p) for p in cfgs}
     if cfgs:
         newest = max(cfgs, key=lambda p: p.stat().st_mtime)
         if newest != tgt_cfg and (not tgt_cfg.exists() or newest.stat().st_mtime > tgt_cfg.stat().st_mtime):
-            cand = load_json(newest, None)
-            if not isinstance(cand, dict):
-                shutil.copy2(newest, tgt_cfg)
-                log(f"claude_desktop_config.json taken from {newest.parent.name} (unparsed)")
-                return
+            cand = configs[newest]
             base, origin = cand, newest.parent.name
     if not isinstance(base, dict) or not tgt_scope:
         return
@@ -599,7 +687,7 @@ def sync_config(target_n, source_n, dirs, trusted):
     if origin is None and prefs.get(GROUP_SCOPES, {}) == scopes:
         return
     prefs[GROUP_SCOPES] = scopes
-    save_json(tgt_cfg, base)
+    plan.add(tgt_cfg, base)
     n, a = (len(entry.get("groups", [])), len(entry.get("assignments", {}))) if entry else (0, 0)
     log((f"claude_desktop_config.json taken from {origin}; " if origin else "")
         + f"sidebar groups for profile {target_n}: {n} groups, {a} filed sessions")
@@ -610,6 +698,8 @@ def sync_config(target_n, source_n, dirs, trusted):
 def claude_pids():
     """Main process only (pgrep does not match it reliably on macOS)."""
     r = subprocess.run(["ps", "-axo", "pid=,comm="], capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError("Cannot check whether Claude is running; switch aborted")
     pids = []
     for line in r.stdout.splitlines():
         pid, _, comm = line.strip().partition(" ")
@@ -622,31 +712,39 @@ def quit_claude():
     if NO_APP or not claude_pids():
         return
     log("quitting Claude …")
-    subprocess.run(["osascript", "-e", 'tell application "Claude" to quit'], capture_output=True, timeout=15)
+    try:
+        result = subprocess.run(["osascript", "-e", 'tell application "Claude" to quit'],
+                                capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("Claude did not confirm quitting; finish your work and quit it manually, then retry") from e
+    if result.returncode:
+        raise RuntimeError("Claude refused to quit; finish your work and quit it manually, then retry")
     for _ in range(30):
         if not claude_pids():
             return
         time.sleep(1)
-    log("Claude not responding – SIGTERM")
-    for p in claude_pids():
-        os.kill(p, 15)
-    for _ in range(10):
-        if not claude_pids():
-            return
-        time.sleep(1)
-    for p in claude_pids():
-        os.kill(p, 9)
-    time.sleep(1)
+    raise RuntimeError("Claude is still running; no force quit was attempted. Quit it manually, then retry")
 
 
 def launch_claude():
     if not NO_APP:
-        subprocess.run(["open", "-a", APP])
+        if subprocess.run(["open", "-a", APP]).returncode:
+            raise RuntimeError("Could not launch Claude; open it manually after checking the active profile")
 
 
 # ---------- switching ----------
 
 def do_switch(target):
+    try:
+        with switch_lock():
+            switch_profile(target)
+    except Exception as e:
+        log(f"switch failed: {e}")
+        notify(f"Profile switch failed: {e}")
+        sys.exit(f"Profile switch failed: {e}")
+
+
+def switch_profile(target):
     act = active_profile()
     if act is None:
         sys.exit("Active profile unknown – run `claude-profiles repair`.")
@@ -656,38 +754,47 @@ def do_switch(target):
     cfg = config()
     label = cfg["labels"].get(str(target), f"Account {target}")
     log(f"=== switch profile {act} -> {target} ({label})")
-    quit_claude()
     parked = PROFILES / str(act)
     incoming = PROFILES / str(target)
     if parked.exists():
-        dialog(f"Switch aborted: {parked} already exists. Run `claude-profiles repair`.")
-        sys.exit(1)
-    PROFILES.mkdir(parents=True, exist_ok=True)
-    LIVE.rename(parked)                                   # 1) park the active profile
-    try:                                                  # 2) activate the target (create on first use)
-        if not incoming.is_dir():
-            incoming.mkdir()
-            src_cfg = parked / "claude_desktop_config.json"
-            if src_cfg.exists():
-                shutil.copy2(src_cfg, incoming / "claude_desktop_config.json")
-        incoming.rename(LIVE)
-        (LIVE / MARKER).write_text(str(target))
-    except Exception as e:
-        log(f"ERROR activating: {e} – restoring profile {act}")
-        if not LIVE.exists():
-            parked.rename(LIVE)
-        dialog(f"Switch failed: {e}\\nProfile {act} was restored. Log: {LOG}")
-        launch_claude()
-        sys.exit(1)
-    cfg["active"] = target
-    save_json(CONFIG, cfg)
-    dirs = all_profile_dirs()                             # 3) sync sessions into the target
+        raise RuntimeError(f"{parked} already exists. Run `claude-profiles repair`")
+    dirs = {**all_profile_dirs(), target: incoming}
+    plan_sync(target, act, dirs)                          # preflight before asking the app to quit
+    if not incoming.exists():
+        read_object(LIVE / "claude_desktop_config.json")  # also validate the first-login config template
+    quit_claude()
     try:
-        synced = sync_sessions(target, act, dirs)
-    except Exception as e:
-        log(f"session sync failed (app starts anyway): {e}")
-        synced = True
-    launch_claude()                                       # 4) relaunch
+        plan = plan_sync(target, act, dirs)               # re-read after the app flushes its final writes
+        synced = plan is not None
+        plan = plan or SyncPlan()
+        if not incoming.exists():
+            src_cfg = read_object(LIVE / "claude_desktop_config.json")
+            if src_cfg is not None:
+                plan.add(incoming / "claude_desktop_config.json", src_cfg)
+        plan.writes[incoming / MARKER] = str(target).encode()
+        plan.add(CONFIG, {**cfg, "active": target})
+        if not NO_APP and claude_pids():
+            raise RuntimeError("Claude restarted during the switch; profile directories were not moved")
+        with plan.apply():
+            # Restore directory locations before the plan restores file contents on failure.
+            LIVE.rename(parked)
+            try:
+                incoming.rename(LIVE)
+            except Exception:
+                try:
+                    parked.rename(LIVE)
+                except OSError as e:
+                    raise RecoveryRequired(
+                        f"Could not restore profile {act} from {parked} to {LIVE}; "
+                        f"target profile remains at {incoming}. Claude was not relaunched. "
+                        "Inspect these directories before running repair") from e
+                raise
+    except RecoveryRequired:
+        raise
+    except Exception:
+        launch_claude()
+        raise
+    launch_claude()
     if synced:
         notify(f"Claude is now running as {label}.")
     else:
@@ -696,12 +803,26 @@ def do_switch(target):
             time.sleep(POLL)
             if index_dir(LIVE):
                 time.sleep(POLL / 3)
+                dirs = all_profile_dirs()
+                plan_sync(target, act, dirs)
+                quit_claude()                             # never race the newly signed-in app's writes
                 try:
-                    sync_sessions(target, act, dirs)
-                    notify(f"Sessions added to {label}. If they are not in the sidebar yet, restart Claude once.")
-                except Exception as e:
-                    log(f"late sync failed: {e}")
+                    plan = plan_sync(target, act, dirs)
+                    if plan is None:
+                        raise RuntimeError("The new profile's session index disappeared; retry switching")
+                    with plan.apply():
+                        pass
+                except RecoveryRequired:
+                    raise
+                except Exception:
+                    launch_claude()
+                    raise
+                launch_claude()
+                notify(f"Sessions added to {label}.")
                 break
+        else:
+            notify("Still waiting for sign-in. After opening the Code tab, switch away and back to sync sessions.")
+            log("first-login session sync pending; switch away and back after signing in")
     log("switch complete.")
 
 
@@ -788,13 +909,14 @@ def entry_template(idx):
 
 
 def do_add(args):
-    cfg = config()
-    n = n_profiles() + 1
-    cfg["profiles"] = n
-    label = " ".join(a for a in args if a != "--switch").strip()
-    if label:
-        cfg["labels"][str(n)] = label
-    save_json(CONFIG, cfg)
+    with switch_lock():
+        cfg = config()
+        n = n_profiles() + 1
+        cfg["profiles"] = n
+        label = " ".join(a for a in args if a != "--switch").strip()
+        if label:
+            cfg["labels"][str(n)] = label
+        save_json(CONFIG, cfg)
     print(f"Added profile {n}{' (' + label + ')' if label else ''}. Switch into it and sign in: claude-profiles {n}")
     if "--switch" in args:
         detach_and_switch(n)
@@ -961,6 +1083,15 @@ def status(as_json=False):
 
 
 def main(argv):
+    # Status stays readable while switching; every other data writer shares the lock.
+    # add releases its own lock before dispatching a switch (also in NO_APP tests).
+    if argv and argv[0] in {"repair", "usage-record", "import", "remove", "label", "profiles"}:
+        with switch_lock():
+            return run_command(argv)
+    return run_command(argv)
+
+
+def run_command(argv):
     if not argv:
         return status()
     cmd, args = argv[0], argv[1:]
@@ -1001,4 +1132,7 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    try:
+        main(sys.argv[1:])
+    except Exception as e:
+        sys.exit(str(e))

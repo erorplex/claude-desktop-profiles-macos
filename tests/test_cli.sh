@@ -4,7 +4,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI="$HERE/../bin/claude-profiles"
 # not under /tmp or /var/folders: the import treats those as throwaway dirs and would skip every fixture
-mkdir -p "$HOME/.cache"; T="$(mktemp -d "$HOME/.cache/claude-profiles-test.XXXXXX")"; trap 'rm -rf "$T"' EXIT
+TEST_ROOT="${CLAUDE_PROFILES_TEST_ROOT:-$HOME/.cache}"
+mkdir -p "$TEST_ROOT"; T="$(mktemp -d "$TEST_ROOT/claude-profiles-test.XXXXXX")"; trap 'rm -rf "$T"' EXIT
 export CLAUDE_PROFILES_APP_SUPPORT="$T/as" CLAUDE_PROFILES_CONFIG="$T/cfg/config.json" \
        CLAUDE_PROFILES_LOG="$T/log" CLAUDE_PROFILES_NO_APP=1 CLAUDE_PROFILES_POLL=0.2 \
        CLAUDE_PROFILES_HOME="$T/home"
@@ -38,12 +39,12 @@ echo "# switch 1 -> 2: Sessions kommen mit, Account-Felder zurückgesetzt"
 [ -f "$LIVE/claude-code-sessions/A2/O2/local_s1.json" ] || fail "s1 fehlt in Profil 2"
 python3 -c "import json;d=json.load(open('$LIVE/claude-code-sessions/A2/O2/local_s1.json'));assert d['remoteMcpServersConfig']==[] and d['bridgeSessionIds']==[] and d['title']=='Alpha'" || fail "switch + sync"; ok "switch + sync"
 
-echo "# Änderung + Löschung in 2 propagieren nach 1"
+echo "# Änderungen propagieren; fehlende Karten löschen keine anderen Kopien"
 python3 -c "import json;p='$LIVE/claude-code-sessions/A2/O2/local_s1.json';d=json.load(open(p));d['title']='Alpha NEU';d['lastActivityAt']=9000;json.dump(d,open(p,'w'))"
 rm "$LIVE/claude-code-sessions/A2/O2/local_s2.json"
 "$CLI" 1 >/dev/null
-[ ! -f "$LIVE/claude-code-sessions/A1/O1/local_s2.json" ] || fail "s2 sollte in 1 gelöscht sein"
-python3 -c "import json;d=json.load(open('$LIVE/claude-code-sessions/A1/O1/local_s1.json'));assert d['title']=='Alpha NEU'" || fail "Update + Löschung propagiert"; ok "Update + Löschung propagiert"
+[ -f "$LIVE/claude-code-sessions/A1/O1/local_s2.json" ] || fail "s2 muss in 1 erhalten bleiben"
+python3 -c "import json;d=json.load(open('$LIVE/claude-code-sessions/A1/O1/local_s1.json'));assert d['title']=='Alpha NEU'" || fail "Update fehlt"; ok "Update propagiert, fehlende Karte erhalten"
 
 echo "# Wechsel in nie benutztes Profil 3: Nach-Sync sobald Index da ist"
 ( sleep 0.5; mkdir -p "$LIVE/claude-code-sessions/A3/O3"; echo '{"lastKnownAccountUuid":"x"}' > "$LIVE/config.json" ) &
@@ -100,10 +101,10 @@ mk_transcript aaaa1111-0000-0000-0000-000000000004 "$T/home/.bot" "Automation im
 mk_transcript aaaa1111-0000-0000-0000-000000000005 "/private/tmp" "Test in tmp" 1                  # temp -> immer übersprungen
 echo '{"type":"summary","summary":"x"}' > "$PRJ/aaaa1111-0000-0000-0000-000000000009.jsonl"   # leer -> überspringen
 "$CLI" import --dry-run | tee "$T/dry.txt" | grep -q 'Login-Bug fixen' || fail "dry-run zeigt Titel nicht"
-[ "$(ls "$LIVE/claude-code-sessions/A1/O1/" | grep -c local_)" = 2 ] || fail "dry-run hat geschrieben"
+[ "$(ls "$LIVE/claude-code-sessions/A1/O1/" | grep -c local_)" = 3 ] || fail "dry-run hat geschrieben"
 "$CLI" import --exclude "$T/home/.bot" > "$T/imp.txt"; cat "$T/imp.txt"
 IDX="$LIVE/claude-code-sessions/A1/O1"
-[ "$(ls "$IDX" | grep -c local_)" = 4 ] || fail "erwartet 2 alte + 2 importierte Einträge, ist: $(ls "$IDX")"
+[ "$(ls "$IDX" | grep -c local_)" = 5 ] || fail "erwartet 3 alte + 2 importierte Einträge, ist: $(ls "$IDX")"
 python3 - "$IDX" <<'PY'
 import json,sys,glob,time
 idx=sys.argv[1]; by={}
@@ -127,7 +128,7 @@ ok "import"
 
 echo "# import-Einträge kommen beim Wechsel mit (Profil 2 wurde oben entfernt -> Profil 3)"
 "$CLI" 3 >/dev/null
-ls "$LIVE/claude-code-sessions/A3/O3/" | grep -c local_ | grep -q 4 || fail "importierte Sessions nicht synchronisiert"
+[ "$(ls "$LIVE/claude-code-sessions/A3/O3/" | grep -c local_)" = 5 ] || fail "importierte Sessions nicht synchronisiert"
 ok "import + sync"
 
 # ---------- Limits: 5-Stunden-Fenster, Woche, Fable ----------

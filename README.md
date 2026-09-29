@@ -33,7 +33,7 @@ The app is ad-hoc signed (no Apple developer account involved). If macOS refuses
 
 Click the person icon in the menu bar (top right, next to the clock) and pick a profile. The menu shows each profile's usage in the current 5-hour window and the 7-day window — plus every per-model window and the reset times, once you have [recorded them](#plan-limits-in-the-menu). ⌘1–⌘9 switch directly.
 
-**Adding an account:** choose *Add profile…*. Claude relaunches signed out — sign in with the other account and open the *Code* tab once; your sessions are added automatically. From then on the profile stays signed in. Repeat for as many accounts as you have.
+**Adding an account:** choose *Add profile…*. Claude relaunches signed out — sign in with the other account and open the *Code* tab once. Wait for the switcher to relaunch Claude again and confirm that sessions were added before starting work. From then on the profile stays signed in. Repeat for as many accounts as you have. If sign-in takes more than about 15 minutes, finish signing in and opening the Code tab, then switch away and back to sync sessions.
 
 Everything is also available from the terminal:
 
@@ -77,12 +77,16 @@ A record belongs to its account and travels into the parking lot with it. Percen
 
 Claude Desktop keeps everything about the signed-in account in `~/Library/Application Support/Claude`. The active profile *is* that directory; every other profile is parked in `~/Library/Application Support/Claude-profiles/<N>`. A switch:
 
-1. quits Claude,
-2. renames the active directory into the parking lot and the target directory into place (two renames, sub-second, no copying),
-3. syncs the Code-tab session index into the target profile — every change made in the profile you just left travels along, sessions you deleted in one profile are removed from the others, and account-bound fields (connectors, remote-control links) stay with the target,
+1. validates the session cards and prepares the sync before asking Claude to quit gracefully,
+2. reads the final saved state again after Claude exits and syncs the Code-tab session index into the parked target — titles, permission modes and archiving travel along, while account-bound fields (connectors, remote-control links) stay with the target,
+3. renames the active directory into the parking lot and the target directory into place (two renames, sub-second, no copying),
 4. relaunches Claude.
 
-Session transcripts live in `~/.claude/projects` and are shared by all profiles anyway; only the small index entries the app uses for its sidebar are synced. Local MCP servers (`claude_desktop_config.json`) are shared too. Sign-in tokens are never read, copied or touched — the sign-in happens in Claude's own flow.
+Session transcripts live in `~/.claude/projects` and are shared by all profiles anyway; only the small index entries the app uses for its sidebar are synced. Local MCP servers (`claude_desktop_config.json`) are shared too. Credentials stay in their own profile directory; the switcher does not extract them or sign in on your behalf — sign-in happens in Claude's own flow.
+
+**Missing session cards never delete other copies.** A card can be missing because of an incomplete write, an app change, or a manual deletion; the switcher cannot distinguish these cases reliably. Existing copies are preserved, and a missing card is restored when switching into that profile. Use **Archive** to hide a session across profiles. This changes the previous behavior that propagated session deletions automatically.
+
+Malformed or unreadable cards stop a switch with an error instead of being skipped. The error identifies the file to repair or restore. JSON writes use atomic replacement, and catchable write or activation failures roll back files already changed. Concurrent switches are rejected. These protections do not replace a backup: a process crash or power loss can still interrupt a multi-file switch; `repair` only fixes directory placement, not damaged JSON.
 
 ### What travels with you
 
@@ -104,7 +108,7 @@ Routines keep their prompts in `~/.claude/scheduled-tasks`, which every profile 
 
 - **Chats in the Chat tab stay with their account.** They live on Anthropic's servers; only Code-tab sessions carry over.
 - **The groups themselves stay with their account.** The sidebar store is synced per account by Claude itself (`ccd/dframe-store`), so the app restores that account's own group names and their order on launch and overwrites anything written locally. Which session sits in which group does travel; creating, renaming or reordering a group has to be done once per account.
-- **One account at a time.** Switching relaunches the app; a running response is interrupted (the session resumes fine afterwards).
+- **One account at a time.** Finish running responses before switching: switching relaunches the app and may interrupt them. If Claude refuses to quit, times out, or remains running, the switch stops without moving profile directories. The switcher never sends SIGTERM or SIGKILL; quit Claude manually and retry.
 - **Relies on the app's internal layout.** The session index format and `plan-usage-history.json` are not public APIs. If an update changes them, run `claude-profiles repair`, check `~/Library/Logs/claude-profiles.log`, and open an issue.
 - **Sign in with one profile at a time.** The browser sign-in returns to the app via a URL callback; make sure only the intended profile is running while you sign in (that is always the case unless you also start Claude with `--user-data-dir` yourself).
 
@@ -125,6 +129,7 @@ Removes the CLI and the menu bar app. The active profile stays in place, so Clau
 ```bash
 ./tests/test_cli.sh     # end-to-end tests in a sandbox; never touches the real app
 python3 tests/test_sync.py   # what a switch carries over, in a sandbox as well
+python3 tests/test_safety.py # malformed data, failed writes, quit refusal, concurrent switches
 ```
 
 `bin/claude-profiles` is a single Python 3 file with no dependencies; `menubar/main.swift` is the menu bar app.

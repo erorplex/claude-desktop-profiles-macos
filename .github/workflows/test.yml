@@ -1,0 +1,20 @@
+name: Tests
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Session sync and failure paths
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: CLI scenarios
+        env:
+          CLAUDE_PROFILES_TEST_ROOT: ${{ runner.temp }}
+        run: bash tests/test_cli.sh
+      - name: Compile menu bar app
+        run: swiftc -O -o "$RUNNER_TEMP/ProfilesForClaude" menubar/main.swift
