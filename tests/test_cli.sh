@@ -4,7 +4,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI="$HERE/../bin/claude-profiles"
 # not under /tmp or /var/folders: the import treats those as throwaway dirs and would skip every fixture
-mkdir -p "$HOME/.cache"; T="$(mktemp -d "$HOME/.cache/claude-profiles-test.XXXXXX")"; trap 'rm -rf "$T"' EXIT
+TEST_ROOT="${CLAUDE_PROFILES_TEST_ROOT:-$HOME/.cache}"
+mkdir -p "$TEST_ROOT"; T="$(mktemp -d "$TEST_ROOT/claude-profiles-test.XXXXXX")"; trap 'rm -rf "$T"' EXIT
 export CLAUDE_PROFILES_APP_SUPPORT="$T/as" CLAUDE_PROFILES_CONFIG="$T/cfg/config.json" \
        CLAUDE_PROFILES_LOG="$T/log" CLAUDE_PROFILES_NO_APP=1 CLAUDE_PROFILES_POLL=0.2 \
        CLAUDE_PROFILES_HOME="$T/home"
@@ -38,12 +39,12 @@ echo "# switch 1 -> 2: Sessions kommen mit, Account-Felder zurückgesetzt"
 [ -f "$LIVE/claude-code-sessions/A2/O2/local_s1.json" ] || fail "s1 fehlt in Profil 2"
 python3 -c "import json;d=json.load(open('$LIVE/claude-code-sessions/A2/O2/local_s1.json'));assert d['remoteMcpServersConfig']==[] and d['bridgeSessionIds']==[] and d['title']=='Alpha'" || fail "switch + sync"; ok "switch + sync"
 
-echo "# Änderung + Löschung in 2 propagieren nach 1"
+echo "# Änderungen propagieren; fehlende Karten löschen keine anderen Kopien"
 python3 -c "import json;p='$LIVE/claude-code-sessions/A2/O2/local_s1.json';d=json.load(open(p));d['title']='Alpha NEU';d['lastActivityAt']=9000;json.dump(d,open(p,'w'))"
 rm "$LIVE/claude-code-sessions/A2/O2/local_s2.json"
 "$CLI" 1 >/dev/null
-[ ! -f "$LIVE/claude-code-sessions/A1/O1/local_s2.json" ] || fail "s2 sollte in 1 gelöscht sein"
-python3 -c "import json;d=json.load(open('$LIVE/claude-code-sessions/A1/O1/local_s1.json'));assert d['title']=='Alpha NEU'" || fail "Update + Löschung propagiert"; ok "Update + Löschung propagiert"
+[ -f "$LIVE/claude-code-sessions/A1/O1/local_s2.json" ] || fail "s2 muss in 1 erhalten bleiben"
+python3 -c "import json;d=json.load(open('$LIVE/claude-code-sessions/A1/O1/local_s1.json'));assert d['title']=='Alpha NEU'" || fail "Update fehlt"; ok "Update propagiert, fehlende Karte erhalten"
 
 echo "# Wechsel in nie benutztes Profil 3: Nach-Sync sobald Index da ist"
 ( sleep 0.5; mkdir -p "$LIVE/claude-code-sessions/A3/O3"; echo '{"lastKnownAccountUuid":"x"}' > "$LIVE/config.json" ) &
@@ -100,10 +101,10 @@ mk_transcript aaaa1111-0000-0000-0000-000000000004 "$T/home/.bot" "Automation im
 mk_transcript aaaa1111-0000-0000-0000-000000000005 "/private/tmp" "Test in tmp" 1                  # temp -> immer übersprungen
 echo '{"type":"summary","summary":"x"}' > "$PRJ/aaaa1111-0000-0000-0000-000000000009.jsonl"   # leer -> überspringen
 "$CLI" import --dry-run | tee "$T/dry.txt" | grep -q 'Login-Bug fixen' || fail "dry-run zeigt Titel nicht"
-[ "$(ls "$LIVE/claude-code-sessions/A1/O1/" | grep -c local_)" = 2 ] || fail "dry-run hat geschrieben"
+[ "$(ls "$LIVE/claude-code-sessions/A1/O1/" | grep -c local_)" = 3 ] || fail "dry-run hat geschrieben"
 "$CLI" import --exclude "$T/home/.bot" > "$T/imp.txt"; cat "$T/imp.txt"
 IDX="$LIVE/claude-code-sessions/A1/O1"
-[ "$(ls "$IDX" | grep -c local_)" = 4 ] || fail "erwartet 2 alte + 2 importierte Einträge, ist: $(ls "$IDX")"
+[ "$(ls "$IDX" | grep -c local_)" = 5 ] || fail "erwartet 3 alte + 2 importierte Einträge, ist: $(ls "$IDX")"
 python3 - "$IDX" <<'PY'
 import json,sys,glob,time
 idx=sys.argv[1]; by={}
@@ -127,7 +128,7 @@ ok "import"
 
 echo "# import-Einträge kommen beim Wechsel mit (Profil 2 wurde oben entfernt -> Profil 3)"
 "$CLI" 3 >/dev/null
-ls "$LIVE/claude-code-sessions/A3/O3/" | grep -c local_ | grep -q 4 || fail "importierte Sessions nicht synchronisiert"
+[ "$(ls "$LIVE/claude-code-sessions/A3/O3/" | grep -c local_)" = 5 ] || fail "importierte Sessions nicht synchronisiert"
 ok "import + sync"
 
 # ---------- Limits: 5-Stunden-Fenster, Woche, Fable ----------
@@ -175,7 +176,7 @@ assert abs(w["five_hour"]["resetsAt"] / 1000 - (time.time() + 3600)) < 120, w["f
 assert p["fh"] == 12 and p["sd"] == 64, p
 PY
 
-echo "# abgelaufenes Fenster gilt als frei, der Reset rollt weiter"
+echo "# abgelaufenes Fenster: keinen zukünftigen Reset erfinden"
 mk_history "$LIVE" O3 80 40 21600          # 6 h alt: kein Beleg im laufenden 5-Stunden-Fenster
 mk_plan 100 -7200 64 90000 100 90000 | "$CLI" usage-record >/dev/null
 check "abgelaufenes Fenster" <<'PY'
@@ -183,7 +184,7 @@ import json, sys, time
 p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
 w = {x["key"]: x for x in p["windows"]}
 assert w["five_hour"]["percentUsed"] == 0, w["five_hour"]
-assert abs(w["five_hour"]["resetsAt"] / 1000 - (time.time() + 3 * 3600)) < 120, w["five_hour"]
+assert w["five_hour"]["resetsAt"] is None, w["five_hour"]
 assert w["weekly"]["percentUsed"] == 64, "frische Aufzeichnung schlägt 6 h alte Historie"
 PY
 
@@ -230,7 +231,7 @@ w3 = {x["key"]: x for x in by[3]["windows"]}
 assert w3["weekly_fable"]["percentUsed"] == 90, w3
 assert "weekly_fable" not in {x["key"] for x in by[1]["windows"]}, by[1]["windows"]
 PY
-echo "# Wochen-Reset aus der App-Historie ableiten, wenn keine Aufzeichnung da ist"
+echo "# Keine Reset-Termine aus historischen Prozentabfällen erfinden"
 mk_weekly_history() { # <Profilordner> <org> <Anker-Offset-h: wann der Wochenreset liegt, relativ zu jetzt-7d> <Bracket-h>
 python3 - "$@" <<'PY2'
 import json, sys, time
@@ -246,17 +247,16 @@ PY2
 }
 rm -f "$LIVE/plan-usage-limits.json"
 mk_weekly_history "$LIVE" O1 3 2
-check "Wochen-Reset abgeleitet" <<'PY2'
+check "Ohne bestätigten Reset kein Termin" <<'PY2'
 import json, sys, time
 p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
 w = {x["key"]: x for x in p["windows"]}
 r = w["weekly"]
-assert r["resetsAt"] is not None, "Wochen-Reset sollte abgeleitet werden"
-assert r.get("estimated") is True, "abgeleitete Zeit muss als Schätzung markiert sein"
-assert abs(r["resetsAt"] / 1000 - (time.time() + 3 * 3600)) < 3600, (r["resetsAt"] / 1000 - time.time()) / 3600
+assert r["resetsAt"] is None, "Historische Abfälle sind kein bestätigter Reset"
+assert not r.get("estimated"), "keine Schätzung anzeigen"
 assert w["five_hour"]["resetsAt"] is None, "ohne laufendes Fenster gibt es keinen 5-Stunden-Reset"
 PY2
-"$CLI" | grep -E '● 1 .*7d .*↻~' >/dev/null || fail "Schätzung muss in der Textausgabe als ~ erkennbar sein"
+"$CLI" | grep -E '● 1 .*7d .*↻~' >/dev/null && fail "Keine erfundene Reset-Schätzung"
 
 echo "# zu unscharfe Historie liefert lieber gar keine Zeit"
 mk_weekly_history "$LIVE" O1 3 40
@@ -267,10 +267,10 @@ w = {x["key"]: x for x in p["windows"]}
 assert w["weekly"]["resetsAt"] is None, w["weekly"]
 PY2
 
-echo "# eine Aufzeichnung schlägt die Schätzung"
+echo "# eine bestätigte Aufzeichnung liefert den Reset"
 mk_weekly_history "$LIVE" O1 3 2
 mk_plan 12 3600 64 90000 100 90000 | "$CLI" usage-record >/dev/null
-check "Aufzeichnung schlägt Schätzung" <<'PY2'
+check "Aufgezeichneter Reset" <<'PY2'
 import json, sys, time
 p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
 w = {x["key"]: x for x in p["windows"]}
