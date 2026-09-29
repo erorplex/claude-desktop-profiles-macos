@@ -4,39 +4,6 @@ import Cocoa
 
 let cli = NSHomeDirectory() + "/.local/bin/claude-profiles"
 
-struct Window: Decodable {
-    let key: String; let label: String?; let percentUsed: Int?; let resetsAt: Double?
-    let estimated: Bool?; let uncertaintyH: Double?
-
-    var short: String {                     // five_hour -> "5 h", weekly_fable -> "Fable"
-        switch key {
-        case "five_hour": return "5 h"
-        case "weekly": return "7 d"
-        default:
-            if let l = label, l.contains("·") {
-                return l.components(separatedBy: "·").last!.trimmingCharacters(in: .whitespaces)
-            }
-            return label ?? key
-        }
-    }
-    var used: String { percentUsed.map { "\($0) %" } ?? "–" }
-    var reset: String? {                    // clock time today, weekday + time later on,
-        guard let ms = resetsAt else { return nil }   // the weekday alone when it is only a guess
-        let d = Date(timeIntervalSince1970: ms / 1000)
-        let guessed = estimated == true
-        let coarse = guessed && (uncertaintyH ?? 0) > 2
-        let f = DateFormatter()
-        f.locale = Locale.current
-        f.dateFormat = coarse ? "EEE" : (Calendar.current.isDateInToday(d) ? "HH:mm" : "EEE HH:mm")
-        return (guessed ? "~" : "") + f.string(from: d)
-    }
-}
-struct Profile: Decodable {
-    let n: Int; let label: String; let active: Bool; let logged_in: Bool
-    let sessions: Int; let fh: Int?; let sd: Int?; let windows: [Window]?
-}
-struct Status: Decodable { let active: Int?; let profiles: [Profile] }
-
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var item: NSStatusItem!
     var timer: Timer?
@@ -86,38 +53,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !menuOpen { item.menu = buildMenu(st) }
         var title = "Profiles"
         if let p = st.profiles.first(where: { $0.active }) {
-            title = p.label
-            if let fh = p.fh, p.logged_in { title += "  \(fh)%" }
-            if !p.logged_in { title += "  (sign in)" }
+            title = p.menuBarTitle
         }
         item.button?.title = switching ? "  switching…" : "  " + title
     }
 
     /// Two lines per profile: the limits on top, when they reset underneath.
     func limitsTitle(_ p: Profile) -> NSAttributedString {
-        var windows = p.windows ?? []
-        if windows.isEmpty {        // older CLI without recorded windows
-            windows = [Window(key: "five_hour", label: nil, percentUsed: p.fh, resetsAt: nil,
-                              estimated: nil, uncertaintyH: nil),
-                       Window(key: "weekly", label: nil, percentUsed: p.sd, resetsAt: nil,
-                              estimated: nil, uncertaintyH: nil)]
-        }
-        let used = windows.map { "\($0.short) \($0.used)" }.joined(separator: "   ")
+        let windows = p.usageWindows
+        let remaining = windows.map { "\($0.short) \($0.remaining)" }.joined(separator: "   ")
         let resets = windows.compactMap { w in w.reset.map { "\(w.short) \($0)" } }
-        let t = NSMutableAttributedString(string: p.label + "   ·   " + used,
+        let t = NSMutableAttributedString(string: p.label + "   ·   " + remaining,
                                           attributes: [.font: NSFont.menuFont(ofSize: 0)])
         if !resets.isEmpty {
             t.append(NSAttributedString(string: "\nresets  " + resets.joined(separator: " · "),
                                         attributes: [.font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
                                                      .foregroundColor: NSColor.secondaryLabelColor]))
         }
+        t.append(NSAttributedString(string: "\n" + p.updated,
+                                    attributes: [.font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
+                                                 .foregroundColor: NSColor.secondaryLabelColor]))
         return t
     }
 
     func buildMenu(_ st: Status) -> NSMenu {
         let menu = NSMenu()
         menu.delegate = self
-        let head = NSMenuItem(title: "Claude Desktop profile", action: nil, keyEquivalent: "")
+        let head = NSMenuItem(title: "Claude Desktop profile · remaining limits", action: nil, keyEquivalent: "")
         head.isEnabled = false
         menu.addItem(head)
         for p in st.profiles {

@@ -25,7 +25,7 @@ fi
 echo "Building the menu bar app …"
 pkill -x ProfilesForClaude 2>/dev/null || true
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS"
-swiftc -O -o "$APP/Contents/MacOS/ProfilesForClaude" "$HERE/menubar/main.swift"
+swiftc -O -o "$APP/Contents/MacOS/ProfilesForClaude" "$HERE/menubar/Usage.swift" "$HERE/menubar/main.swift"
 cp "$HERE/menubar/Info.plist" "$APP/Contents/Info.plist"
 codesign --force -s - "$APP" >/dev/null 2>&1 || true     # ad-hoc signature (no developer account needed)
 open "$APP"

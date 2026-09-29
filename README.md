@@ -31,7 +31,7 @@ The app is ad-hoc signed (no Apple developer account involved). If macOS refuses
 
 ## Use
 
-Click the person icon in the menu bar (top right, next to the clock) and pick a profile. The menu shows each profile's usage in the current 5-hour window and the 7-day window — plus every per-model window and the reset times, once you have [recorded them](#plan-limits-in-the-menu). ⌘1–⌘9 switch directly.
+Click the person icon in the menu bar (top right, next to the clock) and pick a profile. The menu shows the percentage **remaining** in each profile's 5-hour and 7-day windows — plus every per-model window and confirmed reset times, once you have [recorded them](#plan-limits-in-the-menu). The menu bar highlights whichever general limit has less remaining: for example, 14% used over five hours and 96% used over seven days becomes **7 d 4% left**. Per-model caps remain visible in the menu without being presented as a limit on the entire account. The menu also shows how old the cached usage is; Refresh rereads saved data, it does not query Claude's servers. ⌘1–⌘9 switch directly.
 
 **Adding an account:** choose *Add profile…*. Claude relaunches signed out — sign in with the other account and open the *Code* tab once. Wait for the switcher to relaunch Claude again and confirm that sessions were added before starting work. From then on the profile stays signed in. Repeat for as many accounts as you have. If sign-in takes more than about 15 minutes, finish signing in and opening the Code tab, then switch away and back to sync sessions.
 
@@ -67,11 +67,11 @@ claude-profiles usage-record < plan.json   # plan.json: the plan block as get_us
 
 The simplest way to produce that file is a Claude Code session in the app itself — ask Claude to *"read my plan limits and record them with `claude-profiles usage-record`"*, and it pipes its own usage data in. No token, no network call: the command only reads what you hand it.
 
-Without a record, the weekly reset is **derived** from the app's own samples: usage only ever grows inside a window, so every drop in the weekly percentage brackets one reset, and brackets from different weeks pin the same recurring instant down. Derived times are marked with a `~` and shown to the day when the brackets are wide (`7d 75% ↻~Sat`). If the samples are too sparse to place the reset within a day, none is shown. The 5-hour window has no derived time on purpose: it only has a reset while it is actually running, which only the signed-in account can know.
+Without a record, reset times are omitted. A decrease in cached usage can reflect a correction or other change and does not prove the weekly reset schedule. Older versions inferred a date from these drops; this could incorrectly show Monday when Claude itself reported Friday. A `~` marker did not make that estimate reliable, so reset estimation has been removed.
 
 When a session runs into a limit, the app notes the exact reset time so it can resume the session later (`autoResumeRateLimit.<account>` in `claude_desktop_config.json`). The switcher reads that too: an account that is blocked shows *when* its 5-hour window frees up, even if no recording could be made — which is exactly the moment a recording session cannot start.
 
-A record belongs to its account and travels into the parking lot with it. Percentages go stale, reset times do not: once a window's reset time has passed, the window is empty again, so the menu shows it as free and rolls the reset forward by five hours or a week. While an account is active, the app's own samples keep the 5-hour and 7-day numbers current; the per-model windows keep the recorded value until you record again.
+A record belongs to its account and travels with it. Expired reset timestamps are cleared rather than extrapolated into a future window. While an account is active, saved usage samples update the 5-hour and 7-day percentages; the menu can therefore lag behind Claude's live Usage card. Per-model percentages stay at their recorded value until you record again. Use Claude's Usage card as the authority and record fresh plan data to update confirmed reset dates.
 
 ## How it works
 
@@ -130,9 +130,11 @@ Removes the CLI and the menu bar app. The active profile stays in place, so Clau
 ./tests/test_cli.sh     # end-to-end tests in a sandbox; never touches the real app
 python3 tests/test_sync.py   # what a switch carries over, in a sandbox as well
 python3 tests/test_safety.py # malformed data, failed writes, quit refusal, concurrent switches
+python3 tests/test_usage.py  # confirmed reset dates only
+swiftc -o /tmp/test-menu menubar/Usage.swift tests/menu/main.swift && /tmp/test-menu
 ```
 
-`bin/claude-profiles` is a single Python 3 file with no dependencies; `menubar/main.swift` is the menu bar app.
+`bin/claude-profiles` is a single Python 3 file with no dependencies; `menubar/main.swift` is the menu bar app, with usage presentation in `menubar/Usage.swift`.
 
 ## License
 

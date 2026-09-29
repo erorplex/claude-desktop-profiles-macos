@@ -176,7 +176,7 @@ assert abs(w["five_hour"]["resetsAt"] / 1000 - (time.time() + 3600)) < 120, w["f
 assert p["fh"] == 12 and p["sd"] == 64, p
 PY
 
-echo "# abgelaufenes Fenster gilt als frei, der Reset rollt weiter"
+echo "# abgelaufenes Fenster: keinen zukünftigen Reset erfinden"
 mk_history "$LIVE" O3 80 40 21600          # 6 h alt: kein Beleg im laufenden 5-Stunden-Fenster
 mk_plan 100 -7200 64 90000 100 90000 | "$CLI" usage-record >/dev/null
 check "abgelaufenes Fenster" <<'PY'
@@ -184,7 +184,7 @@ import json, sys, time
 p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
 w = {x["key"]: x for x in p["windows"]}
 assert w["five_hour"]["percentUsed"] == 0, w["five_hour"]
-assert abs(w["five_hour"]["resetsAt"] / 1000 - (time.time() + 3 * 3600)) < 120, w["five_hour"]
+assert w["five_hour"]["resetsAt"] is None, w["five_hour"]
 assert w["weekly"]["percentUsed"] == 64, "frische Aufzeichnung schlägt 6 h alte Historie"
 PY
 
@@ -231,7 +231,7 @@ w3 = {x["key"]: x for x in by[3]["windows"]}
 assert w3["weekly_fable"]["percentUsed"] == 90, w3
 assert "weekly_fable" not in {x["key"] for x in by[1]["windows"]}, by[1]["windows"]
 PY
-echo "# Wochen-Reset aus der App-Historie ableiten, wenn keine Aufzeichnung da ist"
+echo "# Keine Reset-Termine aus historischen Prozentabfällen erfinden"
 mk_weekly_history() { # <Profilordner> <org> <Anker-Offset-h: wann der Wochenreset liegt, relativ zu jetzt-7d> <Bracket-h>
 python3 - "$@" <<'PY2'
 import json, sys, time
@@ -247,17 +247,16 @@ PY2
 }
 rm -f "$LIVE/plan-usage-limits.json"
 mk_weekly_history "$LIVE" O1 3 2
-check "Wochen-Reset abgeleitet" <<'PY2'
+check "Ohne bestätigten Reset kein Termin" <<'PY2'
 import json, sys, time
 p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
 w = {x["key"]: x for x in p["windows"]}
 r = w["weekly"]
-assert r["resetsAt"] is not None, "Wochen-Reset sollte abgeleitet werden"
-assert r.get("estimated") is True, "abgeleitete Zeit muss als Schätzung markiert sein"
-assert abs(r["resetsAt"] / 1000 - (time.time() + 3 * 3600)) < 3600, (r["resetsAt"] / 1000 - time.time()) / 3600
+assert r["resetsAt"] is None, "Historische Abfälle sind kein bestätigter Reset"
+assert not r.get("estimated"), "keine Schätzung anzeigen"
 assert w["five_hour"]["resetsAt"] is None, "ohne laufendes Fenster gibt es keinen 5-Stunden-Reset"
 PY2
-"$CLI" | grep -E '● 1 .*7d .*↻~' >/dev/null || fail "Schätzung muss in der Textausgabe als ~ erkennbar sein"
+"$CLI" | grep -E '● 1 .*7d .*↻~' >/dev/null && fail "Keine erfundene Reset-Schätzung"
 
 echo "# zu unscharfe Historie liefert lieber gar keine Zeit"
 mk_weekly_history "$LIVE" O1 3 40
@@ -268,10 +267,10 @@ w = {x["key"]: x for x in p["windows"]}
 assert w["weekly"]["resetsAt"] is None, w["weekly"]
 PY2
 
-echo "# eine Aufzeichnung schlägt die Schätzung"
+echo "# eine bestätigte Aufzeichnung liefert den Reset"
 mk_weekly_history "$LIVE" O1 3 2
 mk_plan 12 3600 64 90000 100 90000 | "$CLI" usage-record >/dev/null
-check "Aufzeichnung schlägt Schätzung" <<'PY2'
+check "Aufgezeichneter Reset" <<'PY2'
 import json, sys, time
 p = [x for x in json.load(open(sys.argv[1]))["profiles"] if x["active"]][0]
 w = {x["key"]: x for x in p["windows"]}

@@ -17,4 +17,8 @@ jobs:
           CLAUDE_PROFILES_TEST_ROOT: ${{ runner.temp }}
         run: bash tests/test_cli.sh
       - name: Compile menu bar app
-        run: swiftc -O -o "$RUNNER_TEMP/ProfilesForClaude" menubar/main.swift
+        run: swiftc -O -o "$RUNNER_TEMP/ProfilesForClaude" menubar/Usage.swift menubar/main.swift
+      - name: Remaining limits in the menu
+        run: |
+          swiftc -o "$RUNNER_TEMP/test-menu" menubar/Usage.swift tests/menu/main.swift
+          "$RUNNER_TEMP/test-menu"
