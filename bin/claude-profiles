@@ -21,10 +21,11 @@ syncs Code-tab sessions into the parked target, renames the two directories
                                       as a Claude Code session's get_usage reports them)
   claude-profiles status --json       machine-readable (used by the menu bar app)
   claude-profiles repair              fix directory state after an interrupted switch
+  claude-profiles sync                repair current sessions/workspaces (relaunches the app)
 """
 import fcntl, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, uuid
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +34,8 @@ APP_SUPPORT = Path(os.environ.get("CLAUDE_PROFILES_APP_SUPPORT", HOME / "Library
 LIVE = APP_SUPPORT / "Claude"
 PROFILES = APP_SUPPORT / "Claude-profiles"
 MANIFEST = PROFILES / "shared" / "sessions-manifest.json"
+SCRATCH = PROFILES / "shared" / "scratch-workspaces"
+WORKTREES = "git-worktrees.json"
 MARKER = ".claude-profiles-id"
 CONFIG = Path(os.environ.get("CLAUDE_PROFILES_CONFIG", HOME / ".config/claude-profiles/config.json"))
 LOG = Path(os.environ.get("CLAUDE_PROFILES_LOG", HOME / "Library/Logs/claude-profiles.log"))
@@ -125,12 +128,19 @@ class SyncPlan:
     """Prepare all JSON before writing. Roll back catchable write/activation failures."""
     def __init__(self):
         self.writes = {}
+        self.scratch = None
 
     def add(self, p, data):
         self.writes[Path(p)] = json.dumps(data, indent=2, ensure_ascii=False).encode()
 
     @contextmanager
     def apply(self):
+        with self.scratch.apply() if self.scratch else nullcontext():
+            with self.apply_files():
+                yield
+
+    @contextmanager
+    def apply_files(self):
         before = {}
         for p in self.writes:
             if p.exists():
@@ -160,6 +170,138 @@ class SyncPlan:
             if failed:
                 raise RecoveryRequired("Rollback incomplete; inspect these files before retrying: " + ", ".join(failed))
             raise
+
+
+def file_digest(path):
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def walk_error(error):
+    raise error
+
+
+class ScratchPlan:
+    """Keep scratch paths stable across directory swaps. Originals remain in recovery backups.
+
+    Root symlinks always point outside the rotating profile directories. Child symlinks are
+    copied as links, never followed. Ambiguous first-migration collisions fail before quitting.
+    After migration there is one tree, so edits and deletions cannot be resurrected by a
+    stale profile. Preparation is read-only; activation and rollback happen with Claude closed.
+    """
+    def __init__(self, dirs):
+        self.roots = [d / "scratch-workspaces" for d in dict.fromkeys(dirs.values())]
+        self.entries = {}
+        self.originals = []
+        if SCRATCH.is_symlink() or (SCRATCH.exists() and not SCRATCH.is_dir()):
+            raise ValueError(f"Invalid shared workspace directory: {SCRATCH}")
+        roots = [SCRATCH] if SCRATCH.exists() else []
+        for root in self.roots:
+            if root.is_symlink():
+                if root.resolve() != SCRATCH.resolve():
+                    raise ValueError(f"Unexpected workspace symlink: {root}")
+                if not SCRATCH.is_dir():
+                    raise ValueError(f"Shared workspaces are missing: {SCRATCH}; restore from workspace-backups before switching")
+            elif root.exists():
+                if not root.is_dir():
+                    raise ValueError(f"Expected a workspace directory: {root}")
+                roots.append(root)
+                self.originals.append(root)
+        # No data needs copying after the one-time migration.
+        self.rebuild = bool(self.originals) or not SCRATCH.exists()
+        if not self.rebuild:
+            return
+        for root in roots:
+            for parent, subdirs, files in os.walk(root, followlinks=False, onerror=walk_error):
+                for name in subdirs + files:
+                    p = Path(parent) / name
+                    rel = p.relative_to(root)
+                    if p.is_symlink():
+                        identity = ("link", os.readlink(p))
+                    elif p.is_dir():
+                        identity = ("dir",)
+                    elif p.is_file():
+                        identity = ("file", file_digest(p))
+                    else:
+                        raise ValueError(f"Unsupported workspace entry: {p}")
+                    if rel in self.entries and self.entries[rel][1] != identity:
+                        raise ValueError(f"Conflicting workspace copies: {self.entries[rel][0]} and {p}; originals kept")
+                    self.entries.setdefault(rel, (p, identity))
+
+    @contextmanager
+    def apply(self):
+        backup = PROFILES / "shared" / "workspace-backups" / uuid.uuid4().hex
+        staged = None
+        replaced = []
+        additions = []
+        installed_shared = False
+        try:
+            if self.rebuild:
+                SCRATCH.parent.mkdir(parents=True, exist_ok=True)
+                staged = Path(tempfile.mkdtemp(prefix=".scratch-stage-", dir=SCRATCH.parent))
+                for rel, (src, identity) in sorted(self.entries.items(), key=lambda x: len(x[0].parts)):
+                    dst = staged / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if identity[0] == "dir":
+                        dst.mkdir(exist_ok=True)
+                    elif identity[0] == "link":
+                        dst.symlink_to(identity[1])
+                    else:
+                        shutil.copy2(src, dst)
+                        if file_digest(dst) != identity[1]:
+                            raise RuntimeError(f"Workspace changed during migration: {src}; retry after closing writers")
+                if not SCRATCH.exists():
+                    staged.rename(SCRATCH)
+                    installed_shared = True
+                    staged = None
+                else:
+                    # Extend an established shared tree without ever moving it away from
+                    # existing symlinks, even if a process/power failure interrupts migration.
+                    for rel, (_, identity) in sorted(self.entries.items(), key=lambda x: len(x[0].parts)):
+                        dst = SCRATCH / rel
+                        if dst.exists() or dst.is_symlink():
+                            continue
+                        if identity[0] == "dir":
+                            dst.mkdir()
+                        else:
+                            (staged / rel).rename(dst)
+                        additions.append((dst, identity[0]))
+            for i, root in enumerate(self.roots):
+                if root.is_symlink():
+                    continue
+                root.parent.mkdir(parents=True, exist_ok=True)
+                old = None
+                if root.exists():
+                    backup.mkdir(parents=True, exist_ok=True)
+                    old = backup / f"profile-{root.parent.name}-{i}"
+                    root.rename(old)
+                replaced.append((root, old))
+                root.symlink_to(SCRATCH, target_is_directory=True)
+            yield
+        except RecoveryRequired:
+            # Directory activation rollback failed; their current locations are uncertain.
+            # Leave the shared tree and backups intact for repair, never delete session data.
+            raise
+        except Exception:
+            try:
+                for root, old in reversed(replaced):
+                    root.unlink(missing_ok=True)
+                    if old is not None:
+                        old.rename(root)
+                if installed_shared:
+                    shutil.rmtree(SCRATCH)
+                else:
+                    for dst, kind in reversed(additions):
+                        dst.rmdir() if kind == "dir" else dst.unlink()
+            except OSError as e:
+                raise RecoveryRequired(f"Workspace rollback incomplete; preserve {backup} and {SCRATCH}") from e
+            raise
+        finally:
+            if staged is not None:
+                shutil.rmtree(staged)
 
 
 @contextmanager
@@ -457,6 +599,7 @@ ROUTINES = "scheduled-tasks.json"             # the app registers routines per a
 ROUTINES_SNAPSHOT = PROFILES / "shared" / "routines-snapshot.json"
 RUN_STATE = ("lastRunAt", "lastScheduledFor", "missedRunScanFloor")   # newest wins, or a slot runs twice
 _MISSING = object()
+WORKSPACE_FIELDS = {"cwd", "originCwd", "worktreeName", "branch", "cliSessionId", "priorCliSessionIds"}
 
 
 def fingerprint(v):
@@ -488,6 +631,18 @@ def merge_session(copies, source_n, base):
             v = next(x for x in vals.values() if counts[fingerprint(x)] == top)
         if v is not _MISSING:
             merged[k] = v
+    # A worktree move/resume changes a bundle of identifiers. Field-by-field majority
+    # can splice a new cwd into an old lease, or resurrect a pre-recovery transcript ID.
+    current = copies.get(source_n)
+    if current is not None and (base is not None or
+            (current.get("lastActivityAt") or 0) >= max(d.get("lastActivityAt") or 0 for d in copies.values())):
+        workspace = current
+    else:
+        workspace = max(copies.values(), key=lambda d: d.get("lastActivityAt") or 0)
+    for k in WORKSPACE_FIELDS:
+        merged.pop(k, None)
+        if k in workspace:
+            merged[k] = workspace[k]
     return merged
 
 
@@ -513,10 +668,11 @@ def plan_sync(target_n, source_n, dirs):
                 m["profiles"].append(n)
     all_sids = {sid for sess in per_profile.values() for sid in sess}
     tgt = per_profile.get(target_n, {})
-    written, fps, archived = 0, {}, set()
+    written, fps, archived, merged_sessions = 0, {}, set(), {}
     for sid in all_sids:
         copies = {n: sess[sid][1] for n, sess in per_profile.items() if sid in sess}
         merged = merge_session(copies, source_n, bases.get(sid))
+        merged_sessions[sid] = merged
         fps[sid] = {k: fingerprint(v) for k, v in merged.items()}
         if merged.get("isArchived"):
             archived.add(sid)
@@ -535,7 +691,67 @@ def plan_sync(target_n, source_n, dirs):
     log(f"prepared sessions -> profile {target_n}: {written} updates, {len(all_sids)} total")
     sync_routines(target_n, source_n, dirs, plan)
     sync_config(target_n, source_n, dirs, trusted, plan)
+    sync_worktrees(target_n, source_n, dirs, merged_sessions, plan)
+    plan.scratch = ScratchPlan(dirs)
     return plan
+
+
+def sync_worktrees(target_n, source_n, dirs, sessions, plan):
+    """Carry local worktree leases with the exact merged session; never run Git mutations.
+
+    The worktrees themselves are already outside the profile directory. Claude must see
+    their registration *before launch*, otherwise it tries to check out an occupied branch.
+    Unknown schema/ambiguous ownership stops the switch instead of detaching or deleting.
+    """
+    registries = {}
+    for n, directory in dirs.items():
+        data = read_object(directory / WORKTREES)
+        if data is None:
+            continue
+        if data.get("schemaVersion") != 2:
+            raise ValueError(f"Unsupported worktree registry version in {directory / WORKTREES}")
+        for key in ("worktrees", "originUrls", "originPins"):
+            if not isinstance(data.get(key, {}), dict):
+                raise ValueError(f"Invalid {key} in {directory / WORKTREES}")
+        for name, e in data.get("worktrees", {}).items():
+            if not isinstance(e, dict) or e.get("name") != name or not isinstance(e.get("path"), str):
+                raise ValueError(f"Invalid worktree {name} in {directory / WORKTREES}")
+        registries[n] = data
+    if not registries:
+        return
+    order = sorted(registries, key=lambda n: (n == source_n, n == target_n,
+                   (dirs[n] / WORKTREES).stat().st_mtime))
+    merged = json.loads(json.dumps(registries[order[-1]]))
+    for key in ("worktrees", "originUrls", "originPins"):
+        merged[key] = {}
+        for n in order:
+            merged[key].update(registries[n].get(key, {}))
+    merged = json.loads(json.dumps(merged))
+    used_paths = {}
+    for sid, session in sessions.items():
+        name, cwd = session.get("worktreeName"), session.get("cwd")
+        if not name or not cwd:
+            continue
+        candidates = [registries[n].get("worktrees", {}).get(name) for n in reversed(order)]
+        entry = next((e for e in candidates if e and e.get("path") == cwd and
+                      e.get("leasedBy") in (None, sid)), None)
+        if entry is None:
+            # No registry ever recorded this checkout: do not invent a trust record.
+            raise ValueError(f"No matching worktree registration for session {sid} at {cwd}; originals kept")
+        if cwd in used_paths and used_paths[cwd] != sid:
+            raise ValueError(f"Worktree {cwd} is claimed by two sessions; originals kept")
+        used_paths[cwd] = sid
+        for old_name, old in merged["worktrees"].items():
+            if old.get("leasedBy") == sid and old_name != name:
+                old["leasedBy"] = None
+        entry = json.loads(json.dumps(entry))
+        entry["leasedBy"] = sid
+        merged["worktrees"][name] = entry
+    # Don't carry the old profile's orphan-GC countdown over a restored registration.
+    gc = merged.get("untrackedDirGc", {})
+    if isinstance(gc, dict) and isinstance(gc.get("sightings"), dict):
+        gc["sightings"] = {p: v for p, v in gc["sightings"].items() if p not in used_paths}
+    plan.add(dirs[target_n] / WORKTREES, merged)
 
 
 def sync_routines(target_n, source_n, dirs, plan):
@@ -727,7 +943,8 @@ def switch_profile(target):
     if parked.exists():
         raise RuntimeError(f"{parked} already exists. Run `claude-profiles repair`")
     dirs = {**all_profile_dirs(), target: incoming}
-    plan_sync(target, act, dirs)                          # preflight before asking the app to quit
+    if plan_sync(target, act, dirs) is None:              # preflight before asking the app to quit
+        ScratchPlan(dirs)
     if not incoming.exists():
         read_object(LIVE / "claude_desktop_config.json")  # also validate the first-login config template
     quit_claude()
@@ -735,6 +952,8 @@ def switch_profile(target):
         plan = plan_sync(target, act, dirs)               # re-read after the app flushes its final writes
         synced = plan is not None
         plan = plan or SyncPlan()
+        if plan.scratch is None:
+            plan.scratch = ScratchPlan(dirs)
         if not incoming.exists():
             src_cfg = read_object(LIVE / "claude_desktop_config.json")
             if src_cfg is not None:
@@ -1016,6 +1235,36 @@ def repair():
             print(f"WARNING: profile {n} is active but {p} also exists – please check manually.")
 
 
+def sync_current(dry_run=False):
+    """Upgrade/repair the active profile with the same transaction used by a switch."""
+    act = active_profile()
+    if act is None:
+        raise RuntimeError("Active profile unknown; run claude-profiles repair first")
+    dirs = all_profile_dirs()
+    plan = plan_sync(act, act, dirs)
+    if plan is None:
+        raise RuntimeError("Open the Code tab once before synchronizing sessions")
+    if dry_run:
+        print(f"Ready: {len(plan.writes)} metadata files; {len(plan.scratch.originals)} workspace roots to share")
+        return
+    quit_claude()
+    try:
+        plan = plan_sync(act, act, dirs)
+        if plan is None:
+            raise RuntimeError("The session index disappeared; synchronization aborted")
+        if not NO_APP and claude_pids():
+            raise RuntimeError("Claude restarted during synchronization; retry after closing it")
+        with plan.apply():
+            pass
+    except RecoveryRequired:
+        raise
+    except Exception:
+        launch_claude()
+        raise
+    launch_claude()
+    print("Local sessions, scratch workspaces and Git worktree registrations synchronized.")
+
+
 def fmt_reset(ms, coarse=False):
     """Clock time for today's resets, weekday + time for later ones, the weekday alone
     when the time itself is only a guess."""
@@ -1053,7 +1302,7 @@ def status(as_json=False):
 def main(argv):
     # Status stays readable while switching; every other data writer shares the lock.
     # add releases its own lock before dispatching a switch (also in NO_APP tests).
-    if argv and argv[0] in {"repair", "usage-record", "import", "remove", "label", "profiles"}:
+    if argv and argv[0] in {"repair", "sync", "usage-record", "import", "remove", "label", "profiles"}:
         with switch_lock():
             return run_command(argv)
     return run_command(argv)
@@ -1067,6 +1316,8 @@ def run_command(argv):
         return status(as_json="--json" in args)
     if cmd == "repair":
         return repair()
+    if cmd == "sync":
+        return sync_current(dry_run="--dry-run" in args)
     if cmd == "usage-record":
         return usage_record()
     if cmd == "import":
