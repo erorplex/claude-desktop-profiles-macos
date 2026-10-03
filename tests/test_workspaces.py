@@ -170,6 +170,83 @@ class WorkspaceTests(unittest.TestCase):
         quit_app.assert_not_called()
         self.assertEqual(self.snapshot(), before)
 
+    def deleted_origin(self):
+        wt, entry = self.make_worktree()
+        repo = Path(entry['baseRepo'])
+        old = self.r.root / 'temporary-origin'
+        common = str(repo / '.git')
+        anchors = [{'gitRoot': str(old), 'commonDir': common},
+                   {'gitRoot': str(repo), 'commonDir': common}]
+        entry.update(baseRepo=str(old), anchors=anchors)
+        self.registry(1, {'session-wt': entry})
+        self.r.edit('local_s1', originCwd=str(old), gitAnchors=anchors, worktreePath=str(wt))
+        return wt, repo, old, entry
+
+    def test_deleted_origin_uses_recorded_main_repo_across_switches(self):
+        wt, repo, old, _ = self.deleted_origin()
+        before = self.git(wt, 'status', '--porcelain=v1')
+        for n in [2, 3, 1]:
+            self.r.switch(n)
+            s = self.r.session(n, 'local_s1')
+            self.assertEqual(s['originCwd'], str(repo))
+            self.assertEqual(s['cwd'], str(wt))
+            self.assertEqual(s['cliSessionId'], 'cli-one')
+            registry = json.loads((self.r.pdir(n) / 'git-worktrees.json').read_text())
+            self.assertEqual(registry['worktrees']['session-wt']['baseRepo'], str(repo))
+            self.assertEqual(self.git(wt, 'status', '--porcelain=v1'), before)
+            self.assertFalse(old.exists())
+
+    def test_origin_recovery_requires_both_recorded_anchors(self):
+        _, _, old, _ = self.deleted_origin()
+        s = self.r.session(1, 'local_s1')
+        for anchors in [[], s['gitAnchors'][:1], s['gitAnchors'][1:]]:
+            self.assertIsNone(self.cli.stable_origin(dict(s, gitAnchors=anchors)))
+        self.assertFalse(old.exists())
+
+    def test_origin_recovery_does_not_move_valid_remote_or_missing_checkouts(self):
+        wt, repo, old, _ = self.deleted_origin()
+        s = self.r.session(1, 'local_s1')
+        for changes in [dict(originCwd=str(repo)), dict(cwd=str(old)),
+                        dict(sshConfig={'host': 'example'}), dict(wslConfig={'distro': 'test'}),
+                        dict(cwd=str(wt / 'nonexistent'))]:
+            self.assertIsNone(self.cli.stable_origin(dict(s, **changes)))
+
+    def test_folder_recovery_transfers_archived_lease_and_preserves_transcript(self):
+        wt, repo, old, _ = self.deleted_origin()
+        self.r.switch(2)
+        self.r.switch(1)
+        self.r.archive('local_s1', True)
+        self.r.edit('local_s2', cwd=str(wt), originCwd=str(wt), cliSessionId='continued-cli',
+                    lastActivityAt=6000)
+        for n in [2, 3, 1]:
+            self.r.switch(n)
+            data = json.loads((self.r.pdir(n) / 'git-worktrees.json').read_text())
+            self.assertEqual(data['worktrees']['session-wt']['leasedBy'], 'local_s2')
+            self.assertEqual(data['worktrees']['session-wt']['baseRepo'], str(repo))
+            self.assertNotIn(str(wt), data['untrackedDirGc']['sightings'])
+            self.assertTrue(self.r.session(n, 'local_s1')['isArchived'])
+            self.assertEqual(self.r.session(n, 'local_s2')['cliSessionId'], 'continued-cli')
+            self.assertNotIn('worktreePath', self.r.session(n, 'local_s2'))
+
+    def test_direct_session_does_not_steal_active_worktree_lease(self):
+        wt, _ = self.make_worktree()
+        self.r.edit('local_s2', cwd=str(wt), originCwd=str(wt), lastActivityAt=6000)
+        self.r.switch(2)
+        data = json.loads((self.r.pdir(2) / 'git-worktrees.json').read_text())
+        self.assertEqual(data['worktrees']['session-wt']['leasedBy'], 'local_s1')
+
+    def test_workspace_move_clears_stale_path_and_anchors_together(self):
+        wt, _ = self.make_worktree()
+        self.r.edit('local_s1', worktreePath=str(wt), gitAnchors=[{'gitRoot': str(wt)}])
+        self.r.switch(2)
+        self.r.edit('local_s1', worktreeName=None, worktreePath=None, branch=None,
+                    cwd='/new/location', originCwd='/new/location', gitAnchors=[])
+        self.r.switch(3)
+        s = self.r.session(3, 'local_s1')
+        self.assertNotIn('worktreePath', s)
+        self.assertNotIn('worktreeName', s)
+        self.assertEqual(s['gitAnchors'], [])
+
     def test_extending_shared_tree_does_not_replace_existing_files(self):
         original, _ = self.make_scratch(); self.r.switch(2)
         new = self.cli.PROFILES / '4'

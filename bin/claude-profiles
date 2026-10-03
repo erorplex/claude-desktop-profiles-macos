@@ -599,7 +599,63 @@ ROUTINES = "scheduled-tasks.json"             # the app registers routines per a
 ROUTINES_SNAPSHOT = PROFILES / "shared" / "routines-snapshot.json"
 RUN_STATE = ("lastRunAt", "lastScheduledFor", "missedRunScanFloor")   # newest wins, or a slot runs twice
 _MISSING = object()
-WORKSPACE_FIELDS = {"cwd", "originCwd", "worktreeName", "branch", "cliSessionId", "priorCliSessionIds"}
+WORKSPACE_FIELDS = {"cwd", "originCwd", "worktreePath", "worktreeName", "branch", "sourceBranch",
+                    "gitAnchors", "gitAnchorsLookupOnly", "gitAnchorsFolderRealpath",
+                    "cliSessionId", "priorCliSessionIds"}
+
+
+def git_identity(folder):
+    """Read identity without changing a checkout or trusting a remote URL alone."""
+    try:
+        def rev(flag):
+            return subprocess.check_output(
+                ["git", "-C", str(folder), "rev-parse", "--path-format=absolute", flag],
+                stderr=subprocess.DEVNULL, text=True, timeout=5).strip()
+        return Path(rev("--show-toplevel")).resolve(), Path(rev("--git-common-dir")).resolve()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def missing_path(path):
+    try:
+        Path(path).stat()
+        return False
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False  # Inaccessible is not proof that a folder was removed.
+
+
+def stable_origin(session):
+    """Recover a deleted launch worktree only from previously recorded Git anchors.
+
+    The conversation's own checkout and transcript stay untouched. No guessed path,
+    clone, symlink or newly trusted repository is created.
+    """
+    origin, cwd = session.get("originCwd"), session.get("cwd")
+    if session.get("sshConfig") or session.get("wslConfig") or not origin or not cwd or origin == cwd:
+        return None
+    if not Path(origin).is_absolute() or not missing_path(origin):
+        return None
+    identity = git_identity(cwd)
+    if identity is None:
+        return None
+    root, common = identity
+    if root != Path(cwd).resolve() or common.name != ".git":
+        return None
+    anchors = session.get("gitAnchors") or []
+    if not isinstance(anchors, list):
+        return None
+    recorded = {a["gitRoot"] for a in anchors if isinstance(a, dict)
+                and isinstance(a.get("gitRoot"), str) and isinstance(a.get("commonDir"), str)
+                and Path(a["commonDir"]).resolve() == common}
+    stable = common.parent
+    stable_record = next((p for p in sorted(recorded) if Path(p).resolve() == stable), None)
+    if origin not in recorded or stable_record is None:
+        return None
+    if git_identity(stable) != (stable, common):
+        return None
+    return stable_record
 
 
 def fingerprint(v):
@@ -672,6 +728,11 @@ def plan_sync(target_n, source_n, dirs):
     for sid in all_sids:
         copies = {n: sess[sid][1] for n, sess in per_profile.items() if sid in sess}
         merged = merge_session(copies, source_n, bases.get(sid))
+        if not merged.get("isArchived"):
+            recovered_origin = stable_origin(merged)
+            if recovered_origin:
+                merged["originCwd"] = recovered_origin
+                log(f"recovered missing origin for {sid} from recorded Git anchors")
         merged_sessions[sid] = merged
         fps[sid] = {k: fingerprint(v) for k, v in merged.items()}
         if merged.get("isArchived"):
@@ -729,6 +790,8 @@ def sync_worktrees(target_n, source_n, dirs, sessions, plan):
     merged = json.loads(json.dumps(merged))
     used_paths = {}
     for sid, session in sessions.items():
+        if session.get("isArchived"):
+            continue
         name, cwd = session.get("worktreeName"), session.get("cwd")
         if not name or not cwd:
             continue
@@ -746,7 +809,28 @@ def sync_worktrees(target_n, source_n, dirs, sessions, plan):
                 old["leasedBy"] = None
         entry = json.loads(json.dumps(entry))
         entry["leasedBy"] = sid
+        # The session may have recovered its deleted launch worktree above.
+        candidate = dict(session, originCwd=entry.get("baseRepo"))
+        recovered_origin = stable_origin(candidate)
+        if recovered_origin:
+            entry["baseRepo"] = recovered_origin
         merged["worktrees"][name] = entry
+    # Claude's Choose folder recovery creates a continuation in the same checkout,
+    # archives the original card, but can leave its lease with that archived card.
+    # Transfer only to a unique active occupant; never steal another active lease.
+    for entry in merged["worktrees"].values():
+        path, owner = entry.get("path"), entry.get("leasedBy")
+        occupants = [sid for sid, s in sessions.items()
+                     if not s.get("isArchived") and s.get("cwd") == path]
+        if not occupants:
+            continue
+        used_paths.setdefault(path, occupants[0])
+        if len(occupants) == 1 and owner in sessions and sessions[owner].get("isArchived"):
+            entry["leasedBy"] = occupants[0]
+            candidate = dict(sessions[owner], originCwd=entry.get("baseRepo"))
+            recovered_origin = stable_origin(candidate)
+            if recovered_origin:
+                entry["baseRepo"] = recovered_origin
     # Don't carry the old profile's orphan-GC countdown over a restored registration.
     gc = merged.get("untrackedDirGc", {})
     if isinstance(gc, dict) and isinstance(gc.get("sightings"), dict):
