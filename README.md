@@ -133,7 +133,7 @@ This is for people who own several Claude accounts and want to use them comforta
 ./uninstall.sh
 ```
 
-Removes the CLI and the menu bar app. The active profile stays in place. Keep `~/Library/Application Support/Claude-profiles/shared`: the active profile's scratch-workspace symlink points there. Parked profile slots can be removed with `claude-profiles remove` before uninstalling; that does not delete the shared tree. Do not delete the entire `Claude-profiles` directory without first copying the shared workspaces back into the active profile.
+Removes the CLI and the menu bar app. The active profile stays in place. Its scratch workspaces link into `~/Library/Application Support/Claude-profiles/shared`, so the script first copies them back into the active profile (quit Claude before running it). Afterwards Claude keeps working exactly as before, and parked profiles remain in `Claude-profiles` until you delete that folder.
 
 ## Development
 
