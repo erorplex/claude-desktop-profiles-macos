@@ -339,4 +339,28 @@ set_resume "$P/3" A1 259200
 five_reset none || fail "Sperre in 3 Tagen ist kein 5-Stunden-Limit"; ok "ferne Sperre ist kein 5h-Reset"
 set_resume "$P/3" A1 7200; mk_history "$LIVE" O1 0 40 600
 five_reset none || fail "ruhendes Fenster bekommt keinen Reset"; ok "ruhendes Fenster ohne Reset"
+
+# uninstall.sh: geteilte Scratch-Ordner kommen als echte Kopie ins aktive Profil zurück
+UNINSTALL="$HERE/../uninstall.sh"; SHARED="$P/shared/scratch-workspaces"
+mkdir -p "$T/home/.local/bin"; touch "$T/home/.local/bin/claude-profiles"
+mv "$LIVE/scratch-workspaces" "$T/own-scratch" 2>/dev/null || true
+ln -s "$T/gone" "$LIVE/scratch-workspaces"
+HOME="$T/home" bash "$UNINSTALL" > "$T/un.out" && fail "Link ins Leere muss die Deinstallation stoppen"
+[ -f "$T/home/.local/bin/claude-profiles" ] || fail "abgebrochene Deinstallation entfernt nichts"
+ok "Link ins Leere stoppt die Deinstallation"
+rm "$LIVE/scratch-workspaces"
+mkdir -p "$SHARED/acc/org/s1/empty"; echo kontext > "$SHARED/acc/org/s1/notes.txt"
+ln -s notes.txt "$SHARED/acc/org/s1/link"; ln -s "$SHARED" "$LIVE/scratch-workspaces"
+HOME="$T/home" bash "$UNINSTALL" > "$T/un.out" || fail "Deinstallation: $(cat "$T/un.out")"
+[ ! -L "$LIVE/scratch-workspaces" ] && [ -d "$LIVE/scratch-workspaces" ] || fail "Scratch-Ordner muss echt sein"
+[ ! -e "$T/home/.local/bin/claude-profiles" ] || fail "CLI muss entfernt sein"
+rm -rf "$P"
+S="$LIVE/scratch-workspaces/acc/org/s1"
+[ "$(cat "$S/notes.txt")" = kontext ] && [ -d "$S/empty" ] && [ "$(readlink "$S/link")" = notes.txt ] \
+  || fail "Inhalt, leere Ordner und Links bleiben nach dem Löschen von Claude-profiles"
+ok "Deinstallation holt Scratch-Ordner zurück"
+rm -rf "$LIVE/scratch-workspaces"; mkdir -p "$T/elsewhere"; ln -s "$T/elsewhere" "$LIVE/scratch-workspaces"
+HOME="$T/home" bash "$UNINSTALL" > "$T/un.out" || fail "eigener Link darf nicht stören"
+[ "$(readlink "$LIVE/scratch-workspaces")" = "$T/elsewhere" ] || fail "eigener Link bleibt unangetastet"
+ok "eigener Link bleibt"
 echo "ALLE TESTS OK"
