@@ -44,6 +44,8 @@ claude-profiles next            # next signed-in profile
 claude-profiles add work        # new profile slot (add --switch: switch into it right away)
 claude-profiles remove 3        # delete a parked profile's sign-in and data (asks first)
 claude-profiles label 2 work    # name a profile
+claude-profiles sync --dry-run  # check existing sessions/workspaces without restarting
+claude-profiles sync            # repair the current profile after upgrading (relaunches Claude)
 ```
 
 ### Import sessions from the CLI or VS Code
@@ -78,11 +80,17 @@ A record belongs to its account and travels with it. Expired reset timestamps ar
 Claude Desktop keeps everything about the signed-in account in `~/Library/Application Support/Claude`. The active profile *is* that directory; every other profile is parked in `~/Library/Application Support/Claude-profiles/<N>`. A switch:
 
 1. validates the session cards and prepares the sync before asking Claude to quit gracefully,
-2. reads the final saved state again after Claude exits and syncs the Code-tab session index into the parked target — titles, permission modes and archiving travel along, while account-bound fields (connectors, remote-control links) stay with the target,
+2. reads the final saved state again after Claude exits, connects all profiles to shared scratch workspaces, and syncs the Code-tab index and matching Git worktree registrations into the parked target — titles, permission modes and archiving travel along, while account-bound fields (connectors, remote-control links) stay with the target,
 3. renames the active directory into the parking lot and the target directory into place (two renames, sub-second, no copying),
 4. relaunches Claude.
 
-Session transcripts live in `~/.claude/projects` and are shared by all profiles anyway; only the small index entries the app uses for its sidebar are synced. Local MCP servers (`claude_desktop_config.json`) are shared too. Credentials stay in their own profile directory; the switcher does not extract them or sign in on your behalf — sign-in happens in Claude's own flow.
+Session transcripts and subagent histories live in `~/.claude/projects` and are already shared by all profiles. The switcher leaves those files untouched. Local MCP servers (`claude_desktop_config.json`) are shared too. Credentials stay in their own profile directory; the switcher does not extract them or sign in on your behalf — sign-in happens in Claude's own flow.
+
+**Working folders now follow their sessions.** Earlier versions copied session cards without `scratch-workspaces` or `git-worktrees.json`. A switch could therefore show "Working folder no longer exists" or try to create a Git branch already checked out in the session's original worktree. On the first switch (or `sync` after upgrading), scratch directories from every profile are consolidated under `Claude-profiles/shared/scratch-workspaces`; each profile gets a directory symlink to that stable location. Existing absolute session paths stay valid. Original directories remain under `shared/workspace-backups`. Different contents at the same path stop migration and identify both originals instead of silently picking one. Later edits and deletions affect the shared tree directly, so stale profiles cannot restore old files.
+
+Git worktrees stay where they are. Their registry entries, leases and existing local origin records are merged to match each session's exact workspace identifiers before Claude launches. Workspace identifiers are carried together, so a recovered session cannot get its old path back through a field-by-field majority. The switcher does not detach branches, reset changes, run `git clean`, or recreate worktrees. Unknown registry schemas and ambiguous/missing registrations stop the switch for inspection.
+
+A session can also fail when its checkout still exists but its **original launch folder** was a temporary worktree that has since been removed. During sync, the switcher can replace that missing origin with the main checkout only when both folders were already recorded in the session's Git anchors and the live checkout resolves to the exact same Git common directory. It preserves the conversation's cwd, branch and transcript. It does not guess replacements for missing working directories or remote sessions. When Claude's own **Choose folder** creates a continuation and archives the original, the registry lease follows the unique active continuation in the same checkout; another active session's lease is never taken.
 
 **Missing session cards never delete other copies.** A card can be missing because of an incomplete write, an app change, or a manual deletion; the switcher cannot distinguish these cases reliably. Existing copies are preserved, and a missing card is restored when switching into that profile. Use **Archive** to hide a session across profiles. This changes the previous behavior that propagated session deletions automatically.
 
@@ -99,6 +107,8 @@ Only one profile is in use between two switches, so whatever differs there from 
 | Which session sits in which sidebar group | `claude_desktop_config.json` → `preferences.epitaxyPrefs.dframe-group-scopes` |
 | Local MCP servers, pins | `claude_desktop_config.json` |
 | Routines (scheduled tasks) | `claude-code-sessions/<account>/<org>/scheduled-tasks.json` |
+| Scratch folders, including empty folders and symlinks | Shared `scratch-workspaces` tree |
+| Git worktree ownership and origin records | `git-worktrees.json` |
 
 Groups are matched by **name**, since each account has its own group ids.
 
@@ -107,6 +117,7 @@ Routines keep their prompts in `~/.claude/scheduled-tasks`, which every profile 
 ## Caveats
 
 - **Chats in the Chat tab stay with their account.** They live on Anthropic's servers; only Code-tab sessions carry over.
+- **Cloud artifacts also belong to their account.** A preserved Code conversation can contain an artifact link that is unavailable after switching accounts. Local HTML/files remain available, but this tool does not republish cloud artifacts.
 - **The groups themselves stay with their account.** The sidebar store is synced per account by Claude itself (`ccd/dframe-store`), so the app restores that account's own group names and their order on launch and overwrites anything written locally. Which session sits in which group does travel; creating, renaming or reordering a group has to be done once per account.
 - **One account at a time.** Finish running responses before switching: switching relaunches the app and may interrupt them. If Claude refuses to quit, times out, or remains running, the switch stops without moving profile directories. The switcher never sends SIGTERM or SIGKILL; quit Claude manually and retry.
 - **Relies on the app's internal layout.** The session index format and `plan-usage-history.json` are not public APIs. If an update changes them, run `claude-profiles repair`, check `~/Library/Logs/claude-profiles.log`, and open an issue.
@@ -122,7 +133,7 @@ This is for people who own several Claude accounts and want to use them comforta
 ./uninstall.sh
 ```
 
-Removes the CLI and the menu bar app. The active profile stays in place, so Claude keeps working exactly as before. Parked profiles remain in `~/Library/Application Support/Claude-profiles` until you delete that folder.
+Removes the CLI and the menu bar app. The active profile stays in place. Keep `~/Library/Application Support/Claude-profiles/shared`: the active profile's scratch-workspace symlink points there. Parked profile slots can be removed with `claude-profiles remove` before uninstalling; that does not delete the shared tree. Do not delete the entire `Claude-profiles` directory without first copying the shared workspaces back into the active profile.
 
 ## Development
 
@@ -130,6 +141,7 @@ Removes the CLI and the menu bar app. The active profile stays in place, so Clau
 ./tests/test_cli.sh     # end-to-end tests in a sandbox; never touches the real app
 python3 tests/test_sync.py   # what a switch carries over, in a sandbox as well
 python3 tests/test_safety.py # malformed data, failed writes, quit refusal, concurrent switches
+python3 tests/test_workspaces.py # repeated switches, dirty Git worktrees, migration and rollback
 python3 tests/test_usage.py  # confirmed reset dates only
 swiftc -o /tmp/test-menu menubar/Usage.swift tests/menu/main.swift && /tmp/test-menu
 ```
