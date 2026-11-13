@@ -10,16 +10,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var switching = false
     var lastActive: Int?
     var menuOpen = false
+    var look = StatusItemLook.starting
+
+    /// Off keeps only the icon in the menu bar. macOS hides menu bar items that do not fit,
+    /// and next to a notch a wide one is the first to go.
+    var showsText: Bool {
+        get { UserDefaults.standard.object(forKey: "ShowMenuBarText") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "ShowMenuBarText") }
+    }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let b = item.button {
-            b.image = NSImage(systemSymbolName: "person.2.circle", accessibilityDescription: "Profiles for Claude")
-            b.imagePosition = .imageLeading
-            b.title = " Profiles"
-        }
+        show(.starting)
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in self.refresh() }
+    }
+
+    /// The symbol carries the state; the text beside it is optional and otherwise the tooltip.
+    func show(_ look: StatusItemLook) {
+        self.look = look
+        guard let b = item.button else { return }
+        let withText = showsText
+        b.image = NSImage(systemSymbolName: look.symbol,
+                          accessibilityDescription: withText ? "Profiles for Claude" : "Profiles for Claude: " + look.text)
+        b.imagePosition = withText ? .imageLeading : .imageOnly
+        b.title = withText ? "  " + look.text : ""
+        b.toolTip = withText ? nil : look.text
     }
 
     func runCLI(_ args: [String]) -> String {
@@ -40,7 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let json = self.runCLI(["status", "--json"])
             guard let data = json.data(using: .utf8),
                   let st = try? JSONDecoder().decode(Status.self, from: data) else {
-                DispatchQueue.main.async { self.item.button?.title = "  Profiles: CLI missing" }
+                DispatchQueue.main.async { self.show(.cliMissing) }
                 return
             }
             DispatchQueue.main.async { self.render(st) }
@@ -51,11 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if switching, let a = st.active, a != lastActive { switching = false }
         lastActive = st.active
         if !menuOpen { item.menu = buildMenu(st) }
-        var title = "Profiles"
-        if let p = st.profiles.first(where: { $0.active }) {
-            title = p.menuBarTitle
-        }
-        item.button?.title = switching ? "  switching…" : "  " + title
+        show(switching ? .switching : .idle(st))
     }
 
     /// Two lines per profile: the limits on top, when they reset underneath.
@@ -105,6 +117,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let note = NSMenuItem(title: "Switching relaunches Claude (~10 s); sessions carry over", action: nil, keyEquivalent: "")
         note.isEnabled = false
         menu.addItem(note)
+        let textItem = NSMenuItem(title: "Show Name and Limit in Menu Bar", action: #selector(toggleText(_:)), keyEquivalent: "")
+        textItem.target = self
+        textItem.state = showsText ? .on : .off
+        menu.addItem(textItem)
         let r = NSMenuItem(title: "Refresh", action: #selector(doRefresh), keyEquivalent: "r")
         r.target = self
         menu.addItem(r)
@@ -122,10 +138,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func nextSwitch() { doSwitch(["next"]) }
     @objc func addProfile() { doSwitch(["add", "--switch"]) }   // new slot; Claude relaunches signed out
     @objc func doRefresh() { refresh() }
+    @objc func toggleText(_ sender: NSMenuItem) {
+        showsText.toggle()
+        sender.state = showsText ? .on : .off
+        show(look)
+    }
 
     func doSwitch(_ args: [String]) {
         switching = true
-        item.button?.title = "  switching…"
+        show(.switching)
         DispatchQueue.global().async {
             let out = self.runCLI(args)          // the CLI detaches and returns immediately
             if out.contains("already") || out.contains("No other") {

@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 func profile(_ fh: Int?, _ weekly: Int?, extra: [[String: Any]] = []) -> Profile {
     var windows: [[String: Any]] = []
@@ -28,4 +28,14 @@ assert(Window(key: "weekly", label: nil, percentUsed: 96, resetsAt: future, esti
 assert(Window(key: "weekly", label: nil, percentUsed: 96, resetsAt: future, estimated: false).reset != nil)
 assert(Window(key: "weekly", label: nil, percentUsed: 96, resetsAt: 1, estimated: false).reset == nil)
 assert(Window(key: "weekly", label: nil, percentUsed: 96, resetsAt: nil, estimated: nil).reset == nil)
+
+// Icon only: the symbol has to tell the states apart, and a misspelled one would leave no icon at all.
+assert(StatusItemLook.idle(Status(active: 1, profiles: [weekly])) ==
+       StatusItemLook(symbol: "person.2.circle", text: "Account 1  ·  7 d 4% left"))
+assert(StatusItemLook.idle(Status(active: nil, profiles: [])) == .starting)
+let looks = [StatusItemLook.starting, .switching, .cliMissing]
+assert(Set(looks.map { $0.symbol }).count == looks.count)
+for look in looks {
+    assert(NSImage(systemSymbolName: look.symbol, accessibilityDescription: nil) != nil, "unknown symbol \(look.symbol)")
+}
 print("Menu usage tests passed")
