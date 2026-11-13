@@ -61,7 +61,7 @@ Titles come from the first message; sessions whose working directory no longer e
 
 ### Plan limits in the menu
 
-Claude Desktop writes how full the 5-hour and the 7-day window are into `plan-usage-history.json` — but not the per-model windows and not when a window resets. Those numbers exist only inside the app, for the account that is signed in right now. `usage-record` stores them next to the app's own file:
+Claude Desktop writes how full the 5-hour and the 7-day window are into `plan-usage-history.json` (plans without a 5-hour window report only the 7-day one, and the menu then shows just that) — but not the per-model windows and not when a window resets. Those numbers exist only inside the app, for the account that is signed in right now. `usage-record` stores them next to the app's own file:
 
 ```bash
 claude-profiles usage-record < plan.json   # plan.json: the plan block as get_usage reports it
