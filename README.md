@@ -35,6 +35,8 @@ Click the person icon in the menu bar (top right, next to the clock) and pick a 
 
 **Adding an account:** choose *Add profile…*. Claude relaunches signed out — sign in with the other account and open the *Code* tab once. Wait for the switcher to relaunch Claude again and confirm that sessions were added before starting work. From then on the profile stays signed in. Repeat for as many accounts as you have. If sign-in takes more than about 15 minutes, finish signing in and opening the Code tab, then switch away and back to sync sessions.
 
+**Which account is which:** name each profile after the account it uses, for example `claude-profiles label 2 you@work.com`. A label belongs to the account that was signed in when you set it (or, without a label, when you first switched away from the profile). If the profile is later signed in with a different account — easy to do after being signed out — the menu marks it with ⚠︎ until you sign in with the right account again, or run `label` again to confirm the new one. Claude does not keep the account's email address on disk, so the switcher cannot show it by itself.
+
 Everything is also available from the terminal:
 
 ```bash
@@ -43,7 +45,7 @@ claude-profiles 2               # switch to profile 2 (or: claude-profiles work)
 claude-profiles next            # next signed-in profile
 claude-profiles add work        # new profile slot (add --switch: switch into it right away)
 claude-profiles remove 3        # delete a parked profile's sign-in and data (asks first)
-claude-profiles label 2 work    # name a profile
+claude-profiles label 2 work    # name a profile (after the account signed in there)
 claude-profiles sync --dry-run  # check existing sessions/workspaces without restarting
 claude-profiles sync            # repair the current profile after upgrading (relaunches Claude)
 ```

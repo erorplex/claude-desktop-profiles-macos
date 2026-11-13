@@ -321,6 +321,7 @@ def switch_lock():
 def config():
     c = read_object(CONFIG, {})
     c.setdefault("labels", {})
+    c.setdefault("accounts", {})      # profile -> account its label belongs to
     c.setdefault("profiles", DEFAULT_PROFILES)
     return c
 
@@ -537,6 +538,12 @@ def logged_in(pdir):
     return any(k.startswith("oauth:tokenCache") for k in c) or "lastKnownAccountUuid" in c
 
 
+def account_of(pdir):
+    """The account a profile was last signed in with, as Claude records it (no credentials involved)."""
+    a = load_json(pdir / "config.json", {}).get("lastKnownAccountUuid")
+    return a if isinstance(a, str) and a else None
+
+
 def profiles():
     cfg = config()
     act = active_profile()
@@ -546,12 +553,15 @@ def profiles():
         d = profile_dir(n)
         exists = d.is_dir()
         idx = index_dir(d) if exists else None
+        acct, bound = account_of(d) if exists else None, cfg["accounts"].get(str(n))
         out.append({
             "n": n,
             "label": cfg["labels"].get(str(n), f"Account {n}"),
             "active": n == act,
             "exists": exists,
             "logged_in": exists and logged_in(d),
+            # signed in with another account than the one the label was given for
+            "account_changed": bool(acct and bound and acct != bound),
             "sessions": len(list(idx.glob("local_*.json"))) if idx else 0,
             **(usage(d, blocked.get(idx.parent.name) if idx else None) if exists
                else {"fh": None, "sd": None, "age": None, "windows": []}),
@@ -1043,7 +1053,10 @@ def switch_profile(target):
             if src_cfg is not None:
                 plan.add(incoming / "claude_desktop_config.json", src_cfg)
         plan.writes[incoming / MARKER] = str(target).encode()
-        plan.add(CONFIG, {**cfg, "active": target})
+        accounts, leaving = dict(cfg["accounts"]), account_of(LIVE)
+        if leaving and str(act) not in accounts:          # first switch away: the label is this account
+            accounts[str(act)] = leaving
+        plan.add(CONFIG, {**cfg, "active": target, "accounts": accounts})
         if not NO_APP and claude_pids():
             raise RuntimeError("Claude restarted during the switch; profile directories were not moved")
         with plan.apply():
@@ -1216,6 +1229,7 @@ def do_remove(args):
             m["profiles"].remove(n)
     save_json(MANIFEST, manifest)
     cfg["labels"].pop(str(n), None)
+    cfg["accounts"].pop(str(n), None)
     if n == n_profiles():                     # removing the last slot shrinks the list; others stay as empty slots
         cfg["profiles"] = max(2, n - 1)
     save_json(CONFIG, cfg)
@@ -1380,6 +1394,8 @@ def status(as_json=False):
             state = "not signed in"
         else:
             state = "   ".join(fmt_window(w) for w in p["windows"]) + f"   {p['sessions']} sessions"
+        if p["account_changed"]:
+            state += "   ⚠ signed in with a different account than before"
         print(f" {mark} {p['n']}  {p['label']:16} {state}")
 
 
@@ -1412,7 +1428,13 @@ def run_command(argv):
         return do_remove(args)
     if cmd == "label" and len(args) >= 2:
         cfg = config()
-        cfg["labels"][str(resolve(args[0]))] = " ".join(args[1:])
+        n = resolve(args[0])
+        cfg["labels"][str(n)] = " ".join(args[1:])
+        acct = account_of(profile_dir(n))         # the label now names the account signed in there
+        if acct:
+            cfg["accounts"][str(n)] = acct
+        else:
+            cfg["accounts"].pop(str(n), None)
         save_json(CONFIG, cfg)
         return status()
     if cmd == "profiles" and len(args) == 1 and args[0].isdigit():

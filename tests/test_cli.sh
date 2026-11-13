@@ -59,6 +59,18 @@ echo "# next, label, profiles-Anzahl"
 "$CLI" profiles 6 >/dev/null; "$CLI" status --json | python3 -c 'import json,sys;assert len(json.load(sys.stdin)["profiles"])==6'
 "$CLI" profiles 4 >/dev/null; ok "next/label/profiles"
 
+echo "# Konto-Prüfung: ein Label gehört zu einem Konto, ein anderes Konto wird markiert"
+acct() { python3 -c 'import json,sys;p=sys.argv[1]+"/config.json";d=json.load(open(p));d["lastKnownAccountUuid"]=sys.argv[2];json.dump(d,open(p,"w"))' "$1" "$2"; }
+changed() { "$CLI" status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["profiles"][int(sys.argv[1])-1]["account_changed"])' "$1"; }
+[ "$(changed 3)" = False ] || fail "Profil 3 wird beim Verlassen an sein Konto gebunden"
+acct "$P/3" y; [ "$(changed 3)" = True ] || fail "anderes Konto in Profil 3 muss markiert werden"
+"$CLI" | grep -q '⚠' || fail "Textstatus zeigt die Warnung nicht"
+acct "$P/3" x; [ "$(changed 3)" = False ] || fail "wieder das alte Konto: keine Warnung"
+acct "$P/2" a; "$CLI" label 2 "Arbeit" >/dev/null; acct "$P/2" b
+[ "$(changed 2)" = True ] || fail "label bindet an das angemeldete Konto"
+"$CLI" label 2 "Arbeit" >/dev/null; [ "$(changed 2)" = False ] || fail "erneutes label bestätigt das neue Konto"
+ok "Konto-Prüfung"
+
 echo "# add: neuer Slot mit Label, add --switch wechselt sofort hinein"
 "$CLI" add "Kunde X" | grep -q '5' || fail "add sollte Slot 5 melden"
 "$CLI" status --json | python3 -c 'import json,sys;d=json.load(sys.stdin);p=d["profiles"];assert len(p)==5 and p[4]["label"]=="Kunde X" and not p[4]["logged_in"]'

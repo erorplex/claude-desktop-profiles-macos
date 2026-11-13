@@ -65,6 +65,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let resets = windows.compactMap { w in w.reset.map { "\(w.short) \($0)" } }
         let t = NSMutableAttributedString(string: p.label + "   ·   " + remaining,
                                           attributes: [.font: NSFont.menuFont(ofSize: 0)])
+        if let warning = p.accountWarning {
+            t.append(NSAttributedString(string: "\n⚠︎ " + warning,
+                                        attributes: [.font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
+                                                     .foregroundColor: NSColor.systemOrange]))
+        }
         if !resets.isEmpty {
             t.append(NSAttributedString(string: "\nresets  " + resets.joined(separator: " · "),
                                         attributes: [.font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
