@@ -843,7 +843,8 @@ def sync_routines(target_n, source_n, dirs, plan):
     prompts live in the shared ~/.claude/scheduled-tasks. Treat them like sessions: every profile gets every
     routine, the profile just left decides the definition, the newest run state wins everywhere (so a slot
     that already ran is not caught up again after the switch), and a routine deleted in the profile just
-    left is removed from all profiles at once."""
+    left is removed from all profiles at once - provided that profile still uses the file the last switch
+    wrote."""
     files = {n: index_dir(d) / ROUTINES for n, d in dirs.items() if index_dir(d)}
     if target_n not in files:
         return
@@ -858,8 +859,17 @@ def sync_routines(target_n, source_n, dirs, plan):
     tasks = {n: {x["id"]: x for x in (d or {}).get("scheduledTasks", []) if isinstance(x, dict) and x.get("id")}
              for n, d in data.items()}
     snap = read_object(ROUTINES_SNAPSHOT, {})
-    known = set(snap.get("ids", [])) if snap.get("target") == source_n else set()
-    gone = known - set(tasks.get(source_n, {})) if data.get(source_n) is not None else set()
+    where = {n: f"{f.parent.parent.name}/{f.parent.name}" for n, f in files.items()}
+    missing = set()
+    if snap.get("target") == source_n and data.get(source_n) is not None:
+        missing = set(snap.get("ids", [])) - set(tasks.get(source_n, {}))
+    # Only the file the last switch wrote can report a deletion. After a sign-in with another account (or a
+    # move to another organization) the app starts a new, empty file: what is missing there was never
+    # deleted and is carried into that file below. Snapshots from older versions name no file at all.
+    gone = missing if snap.get("index") == where.get(source_n) else set()
+    if missing and not gone:
+        log(f"profile {source_n} now registers routines in {where.get(source_n)} instead of "
+            f"{snap.get('index') or 'an unrecorded file'}: {len(missing)} missing there are kept, not deleted")
     for n in tasks:
         dropped = gone & set(tasks[n])
         for rid in dropped:
@@ -885,7 +895,7 @@ def sync_routines(target_n, source_n, dirs, plan):
         if out != data.get(target_n):
             plan.add(files[target_n], out)
             log(f"routines -> profile {target_n}: {len(merged)} ({', '.join(merged) or 'none'})")
-    plan.add(ROUTINES_SNAPSHOT, {"target": target_n, "ids": sorted(merged)})
+    plan.add(ROUTINES_SNAPSHOT, {"target": target_n, "index": where[target_n], "ids": sorted(merged)})
 
 
 def write_archive_index(idx, archived, known, plan):
