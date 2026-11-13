@@ -488,7 +488,8 @@ def rate_limit_resets():
 def usage(pdir, blocked=None):
     """What is left of the account's limits: the app's own samples (fh = 5-hour %, sd = 7-day %)
     merged with our recorded windows, which also know the per-model limits and the reset times.
-    A window whose reset time has passed is empty again, however old the numbers are."""
+    A window whose reset time has passed is empty again, however old the numbers are. A window the
+    app's newest sample does not mention at all is one the plan does not have (weekly-only plans)."""
     now = time.time()
     samples = (load_json(pdir / "plan-usage-history.json", None) or {}).get("samples") or []
     s = samples[-1] if samples else None
@@ -516,8 +517,11 @@ def usage(pdir, blocked=None):
             win = {"key": key, "label": w.get("label"), "percentUsed": pct, "resetsAt": resets}
             windows.append(win)
     else:
-        for key, label, pct, period in (("five_hour", "5-hour limit", u.get("fh"), FIVE_H),
-                                        ("weekly", "Weekly · all models", u.get("sd"), SEVEN_D)):
+        for key, label, field, period in (("five_hour", "5-hour limit", "fh", FIVE_H),
+                                          ("weekly", "Weekly · all models", "sd", SEVEN_D)):
+            if u and field not in u:                   # not part of this plan: neither unknown nor reset
+                continue
+            pct = u.get(field)
             if h_t and now - h_t > period:             # the window has certainly reset
                 pct = 0
             windows.append({"key": key, "label": label, "percentUsed": pct, "resetsAt": None})
