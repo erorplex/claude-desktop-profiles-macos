@@ -112,7 +112,7 @@ Only one profile is in use between two switches, so whatever differs there from 
 
 Groups are matched by **name**, since each account has its own group ids.
 
-Routines keep their prompts in `~/.claude/scheduled-tasks`, which every profile shares anyway — but the app registers the *schedule* per account. A switch carries every registration into the target, with the newest run state, so a slot that already ran in one account is not caught up again in the next. A routine deleted in the profile you just left is removed from all profiles at once.
+Routines keep their prompts in `~/.claude/scheduled-tasks`, which every profile shares anyway — but the app registers the *schedule* per account. A switch carries every registration into the target, with the newest run state, so a slot that already ran in one account is not caught up again in the next. A routine deleted in the profile you just left is removed from all profiles at once — as long as that profile still uses the registration file of the last switch. After signing in with another account (or moving to another organization) the app starts a new, empty file; routines missing there were never deleted, so they stay everywhere and are carried into the new file instead.
 
 ## Caveats
 
