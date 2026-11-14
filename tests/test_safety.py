@@ -79,7 +79,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_malformed_auxiliary_data_aborts_before_any_writes(self):
         paths = [self.r.idx(2) / "archived-sessions.idx", self.r.idx(1) / "scheduled-tasks.json",
-                 self.r.pdir(2) / "claude_desktop_config.json", self.cli.MANIFEST, self.cli.SNAPSHOT,
+                 self.r.pdir(2) / "claude_desktop_config.json", self.cli.SNAPSHOT,
                  self.cli.ROUTINES_SNAPSHOT, self.r.pdir(1) / "config.json", self.cli.CONFIG]
         for p in paths:
             with self.subTest(path=p.name):
@@ -256,7 +256,60 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(self.r.active(), 2)  # sign-in is retained; original cards remain parked
         self.assertTrue((self.r.idx(1) / "local_s1.json").is_file())
         self.assertFalse(any("Sessions added" in c.args[0] for c in notify.call_args_list))
-        self.assertIn("failed", notify.call_args.args[0])
+        last = notify.call_args.args[0]
+        self.assertNotIn("Profile switch failed", last, "the switch itself completed")
+        self.assertIn("switch away and back", last.lower())
+
+    def test_first_login_wait_does_not_hold_the_lock(self):
+        import shutil
+        shutil.rmtree(self.r.pdir(2))
+        free = []
+
+        def signing_in(_seconds):
+            with self.cli.switch_lock():                  # e.g. usage-record or label while the user signs in
+                free.append(True)
+            self.r.idx(2).mkdir(parents=True, exist_ok=True)
+
+        with patch.object(self.cli.time, "sleep", signing_in), \
+                patch.object(self.cli, "quit_claude"), patch.object(self.cli, "launch_claude"):
+            self.cli.do_switch(2)
+        self.assertTrue(free)
+        self.assertEqual(set(self.cli.sessions_in(self.r.pdir(2))), set(SIDS))
+
+    def test_quit_refusal_after_first_login_is_a_missing_sync_not_a_failed_switch(self):
+        import shutil
+        shutil.rmtree(self.r.pdir(2))
+
+        def signed_in(_seconds):
+            self.r.idx(2).mkdir(parents=True, exist_ok=True)
+
+        refused = RuntimeError("Claude refused to quit; finish your work and quit it manually, then retry")
+        with patch.object(self.cli.time, "sleep", signed_in), patch.object(self.cli, "notify") as notify, \
+                patch.object(self.cli, "quit_claude", side_effect=[None, refused]), \
+                patch.object(self.cli, "launch_claude") as launch:
+            with self.assertRaisesRegex(SystemExit, "not synced yet"):
+                self.cli.do_switch(2)
+        self.assertEqual(self.r.active(), 2)
+        self.assertEqual(launch.call_count, 1, "Claude kept running, so there is nothing to relaunch")
+        last = notify.call_args.args[0]
+        self.assertNotIn("Profile switch failed", last)
+        self.assertIn("refused to quit", last)
+        self.assertIn("switch away and back", last.lower())
+
+    def test_first_login_sync_is_skipped_once_another_profile_is_active(self):
+        import shutil
+        shutil.rmtree(self.r.pdir(2))
+
+        def switched_elsewhere(_seconds):                 # the user switched on while profile 2 waited
+            (self.cli.LIVE / self.cli.MARKER).write_text("3")
+            self.r.idx(2).mkdir(parents=True, exist_ok=True)
+
+        with patch.object(self.cli.time, "sleep", switched_elsewhere), patch.object(self.cli, "notify") as notify, \
+                patch.object(self.cli, "quit_claude") as quit_app, patch.object(self.cli, "launch_claude"):
+            self.cli.do_switch(2)
+        self.assertEqual(quit_app.call_count, 1, "only the switch itself quits the app")
+        self.assertFalse(any("Sessions added" in c.args[0] for c in notify.call_args_list))
+        self.assertIn("first-login session sync is skipped", (self.r.root / "switch.log").read_text())
 
     def test_quit_veto_does_not_move_profiles_or_kill_processes(self):
         before = self.snapshot()

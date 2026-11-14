@@ -33,7 +33,6 @@ HOME = Path(os.environ.get("CLAUDE_PROFILES_HOME", Path.home()))
 APP_SUPPORT = Path(os.environ.get("CLAUDE_PROFILES_APP_SUPPORT", HOME / "Library/Application Support"))
 LIVE = APP_SUPPORT / "Claude"
 PROFILES = APP_SUPPORT / "Claude-profiles"
-MANIFEST = PROFILES / "shared" / "sessions-manifest.json"
 SCRATCH = PROFILES / "shared" / "scratch-workspaces"
 WORKTREES = "git-worktrees.json"
 MARKER = ".claude-profiles-id"
@@ -122,6 +121,10 @@ def save_json(p, data):
 
 class RecoveryRequired(RuntimeError):
     """Restoration failed; do not write more files or launch the app."""
+
+
+class LockBusy(RuntimeError):
+    """Another command holds the switch lock."""
 
 
 class SyncPlan:
@@ -311,7 +314,7 @@ def switch_lock():
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise RuntimeError("Another profile switch is in progress; wait for it to finish")
+            raise LockBusy("Another profile switch is in progress; wait for it to finish")
         try:
             yield
         finally:
@@ -711,17 +714,11 @@ def plan_sync(target_n, source_n, dirs):
         log(f"profile {target_n}: no session index yet (sign in and open the Code tab) – syncing later")
         return None
     plan = SyncPlan()
-    manifest = read_object(MANIFEST, {})
     snap = read_object(SNAPSHOT, {})
     trusted = snap.get("target") == source_n
     bases = snap.get("sessions", {}) if trusted else {}
     if not trusted:
         log(f"no trusted snapshot for profile {source_n} – majority decides this time")
-    for n, sess in per_profile.items():
-        for sid in sess:
-            m = manifest.setdefault(sid, {"profiles": []})
-            if n not in m["profiles"]:
-                m["profiles"].append(n)
     all_sids = {sid for sess in per_profile.values() for sid in sess}
     tgt = per_profile.get(target_n, {})
     written, fps, archived, merged_sessions = 0, {}, set(), {}
@@ -744,9 +741,6 @@ def plan_sync(target_n, source_n, dirs):
         name = next(sess[sid][0].name for sess in per_profile.values() if sid in sess)
         plan.add(target_idx / name, out)
         written += 1
-        if target_n not in manifest[sid]["profiles"]:
-            manifest[sid]["profiles"].append(target_n)
-    plan.add(MANIFEST, manifest)
     plan.add(SNAPSHOT, {"target": target_n, "sessions": fps})
     write_archive_index(target_idx, archived, all_sids, plan)
     log(f"prepared sessions -> profile {target_n}: {written} updates, {len(all_sids)} total")
@@ -1005,20 +999,23 @@ def launch_claude():
 def do_switch(target):
     try:
         with switch_lock():
-            switch_profile(target)
+            pending = switch_profile(target)
     except Exception as e:
         log(f"switch failed: {e}")
         notify(f"Profile switch failed: {e}")
         sys.exit(f"Profile switch failed: {e}")
+    if pending:
+        finish_first_login(target, *pending)
 
 
 def switch_profile(target):
+    """Returns (source profile, label) when the target still has to be signed in, else None."""
     act = active_profile()
     if act is None:
         sys.exit("Active profile unknown – run `claude-profiles repair`.")
     if target == act:
         log(f"profile {target} is already active.")
-        return
+        return None
     cfg = config()
     label = cfg["labels"].get(str(target), f"Account {target}")
     log(f"=== switch profile {act} -> {target} ({label})")
@@ -1066,35 +1063,67 @@ def switch_profile(target):
         launch_claude()
         raise
     launch_claude()
+    log("switch complete.")
     if synced:
         notify(f"Claude is now running as {label}.")
-    else:
-        notify(f"Claude is now running as {label}. Sign in and open the Code tab – your sessions follow automatically.")
-        for _ in range(90):                               # wait up to ~15 min for the first login
-            time.sleep(POLL)
-            if index_dir(LIVE):
-                time.sleep(POLL / 3)
-                dirs = all_profile_dirs()
-                plan_sync(target, act, dirs)
-                quit_claude()                             # never race the newly signed-in app's writes
-                try:
-                    plan = plan_sync(target, act, dirs)
-                    if plan is None:
-                        raise RuntimeError("The new profile's session index disappeared; retry switching")
-                    with plan.apply():
-                        pass
-                except RecoveryRequired:
-                    raise
-                except Exception:
-                    launch_claude()
-                    raise
-                launch_claude()
-                notify(f"Sessions added to {label}.")
-                break
-        else:
-            notify("Still waiting for sign-in. After opening the Code tab, switch away and back to sync sessions.")
-            log("first-login session sync pending; switch away and back after signing in")
-    log("switch complete.")
+        return None
+    notify(f"Claude is now running as {label}. Sign in and open the Code tab – your sessions follow automatically.")
+    return act, label
+
+
+def finish_first_login(target, source, label):
+    """Sync sessions into a profile once its first sign-in has created the session index. The switch is
+    already complete: the lock is not held while the user signs in (usage-record, label and import keep
+    working), and a failure here is reported as a missing session sync, not as a failed switch."""
+    skipped = f"profile {target} is no longer active; its first-login session sync is skipped"
+    for _ in range(90):                                   # wait up to ~15 min for the first login
+        time.sleep(POLL)
+        if active_profile() != target:
+            log(skipped)
+            return
+        if not index_dir(LIVE):
+            continue
+        time.sleep(POLL / 3)
+        try:
+            with switch_lock():
+                if active_profile() != target:
+                    log(skipped)
+                    return
+                sync_first_login(target, source)
+        except LockBusy:
+            continue                                      # another command is writing; try again shortly
+        except RecoveryRequired as e:
+            log(f"first-login session sync stopped: {e}")
+            notify(f"Session sync for {label} stopped: {e}")
+            sys.exit(f"Session sync for {label} stopped: {e}")
+        except Exception as e:
+            message = f"Switched to {label}, but its sessions are not synced yet: {e}. Switch away and back to sync them."
+            log(f"first-login session sync incomplete: {e}")
+            notify(message)
+            sys.exit(message)
+        notify(f"Sessions added to {label}.")
+        log(f"first-login sessions synced into profile {target}")
+        return
+    notify("Still waiting for sign-in. After opening the Code tab, switch away and back to sync sessions.")
+    log("first-login session sync pending; switch away and back after signing in")
+
+
+def sync_first_login(target, source):
+    dirs = all_profile_dirs()
+    plan_sync(target, source, dirs)                       # preflight before asking the app to quit
+    quit_claude()                                         # never race the newly signed-in app's writes
+    try:
+        plan = plan_sync(target, source, dirs)
+        if plan is None:
+            raise RuntimeError("the new profile's session index disappeared")
+        with plan.apply():
+            pass
+    except RecoveryRequired:
+        raise
+    except Exception:
+        launch_claude()
+        raise
+    launch_claude()
 
 
 def detach_and_switch(target):
@@ -1210,11 +1239,6 @@ def do_remove(args):
             sys.exit("Cancelled.")
     if d.is_dir():
         shutil.rmtree(d)
-    manifest = load_json(MANIFEST, {})
-    for m in manifest.values():
-        if n in m.get("profiles", []):
-            m["profiles"].remove(n)
-    save_json(MANIFEST, manifest)
     cfg["labels"].pop(str(n), None)
     if n == n_profiles():                     # removing the last slot shrinks the list; others stay as empty slots
         cfg["profiles"] = max(2, n - 1)
@@ -1240,8 +1264,6 @@ def do_import(args):
     now = int(time.time() * 1000)
     cutoff = now - days * 86400 * 1000
     imported, skipped_known, skipped_empty, skipped_excluded, skipped_cwd = 0, 0, 0, 0, []
-    manifest = load_json(MANIFEST, {})
-    act = active_profile()
     for t in sorted(TRANSCRIPTS.glob("*/*.jsonl")):
         sid = t.stem
         if sid in known:
@@ -1276,10 +1298,7 @@ def do_import(args):
         print(f"  + {entry['title'][:TITLE_MAX]:{TITLE_MAX}}  {time.strftime('%Y-%m-%d', time.localtime(last / 1000))}{flag}")
         if not dry:
             (idx / f"{entry['sessionId']}.json").write_text(json.dumps(entry))
-            manifest.setdefault(entry["sessionId"], {"profiles": []})["profiles"].append(act)
         imported += 1
-    if not dry:
-        save_json(MANIFEST, manifest)
     for title, cwd in skipped_cwd:
         print(f"  - skipped (cwd no longer exists: {cwd}): {title}")
     verb = "would import" if dry else "imported"

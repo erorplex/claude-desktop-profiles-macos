@@ -30,9 +30,7 @@ class Rig:
             (idx / "archived-sessions.idx").write_text(json.dumps({"v": 1, "archived": []}))
             (d / "claude_desktop_config.json").write_text(json.dumps({"preferences": {"epitaxyPrefs": {}}}))
         (self.root / "cfg.json").write_text(json.dumps({"labels": {}, "active": 1, "profiles": 3}))
-        man = self.sup / "Claude-profiles" / "shared" / "sessions-manifest.json"
-        man.parent.mkdir(parents=True, exist_ok=True)
-        man.write_text(json.dumps({sid: {"profiles": [1, 2, 3]} for sid in SIDS}))
+        (self.sup / "Claude-profiles" / "shared").mkdir(parents=True, exist_ok=True)
 
     def pdir(self, n):
         return self.sup / "Claude" if self.active() == n else self.sup / "Claude-profiles" / str(n)
@@ -299,6 +297,11 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(d["recordedSkips"], {"x": 1}, "Buchhaltung des Zielkontos bleibt")
         self.r.switch(1)
         self.assertEqual(self.r.routine_ids(1), {"limits", "nur-in-2"})
+
+    def test_kein_sitzungsmanifest_mehr(self):
+        """sessions-manifest.json steuert seit dem Ende der Loeschweitergabe nichts mehr und wird nicht geschrieben."""
+        self.r.switch(2)
+        self.assertFalse((self.r.sup / "Claude-profiles" / "shared" / "sessions-manifest.json").exists())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
