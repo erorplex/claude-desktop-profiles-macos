@@ -20,7 +20,8 @@ syncs Code-tab sessions into the parked target, renames the two directories
   claude-profiles usage-record        store the active account's plan limits (JSON on stdin,
                                       as a Claude Code session's get_usage reports them)
   claude-profiles status --json       machine-readable (used by the menu bar app)
-  claude-profiles repair              fix directory state after an interrupted switch
+  claude-profiles repair              fix directory state after an interrupted switch and
+                                      remove workspace backups older than 30 days
   claude-profiles sync                repair current sessions/workspaces (relaunches the app)
 """
 import fcntl, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, uuid
@@ -35,6 +36,8 @@ LIVE = APP_SUPPORT / "Claude"
 PROFILES = APP_SUPPORT / "Claude-profiles"
 MANIFEST = PROFILES / "shared" / "sessions-manifest.json"
 SCRATCH = PROFILES / "shared" / "scratch-workspaces"
+WORKSPACE_BACKUPS = PROFILES / "shared" / "workspace-backups"   # originals set aside by the workspace migration
+BACKUP_DAYS = 30                                                 # repair removes backups older than this
 WORKTREES = "git-worktrees.json"
 MARKER = ".claude-profiles-id"
 CONFIG = Path(os.environ.get("CLAUDE_PROFILES_CONFIG", HOME / ".config/claude-profiles/config.json"))
@@ -233,7 +236,7 @@ class ScratchPlan:
 
     @contextmanager
     def apply(self):
-        backup = PROFILES / "shared" / "workspace-backups" / uuid.uuid4().hex
+        backup = WORKSPACE_BACKUPS / uuid.uuid4().hex
         staged = None
         replaced = []
         additions = []
@@ -1292,6 +1295,54 @@ def do_import(args):
 
 # ---------- repair & status ----------
 
+def workspace_backups():
+    """Originals the one-time workspace migration set aside, oldest first: [(path, last modified)]."""
+    if not WORKSPACE_BACKUPS.is_dir():
+        return []
+    found = [(p, p.stat().st_mtime) for p in WORKSPACE_BACKUPS.iterdir() if p.is_dir() and not p.is_symlink()]
+    return sorted(found, key=lambda b: b[1])
+
+
+def tree_size(path):
+    total = 0
+    for parent, _, files in os.walk(path, followlinks=False):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(parent, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def fmt_size(n):
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def prune_workspace_backups():
+    """A migration that went wrong shows up within days, so backups older than BACKUP_DAYS go - but never
+    while the shared tree they were merged into is missing, because then they are the only copy."""
+    now = time.time()
+    old = [(p, t) for p, t in workspace_backups() if now - t > BACKUP_DAYS * 86400]
+    if not old:
+        return
+    if not SCRATCH.is_dir():
+        print(f"Kept {len(old)} old workspace backup(s): {SCRATCH} is missing; restore it from {WORKSPACE_BACKUPS} first.")
+        return
+    for p, t in old:
+        days, size = int((now - t) / 86400), fmt_size(tree_size(p))
+        try:
+            shutil.rmtree(p)
+        except OSError as e:
+            print(f"Could not remove workspace backup {p}: {e}")
+            continue
+        log(f"removed workspace backup {p.name} ({days} days old, {size})")
+        print(f"Removed workspace backup {p.name} ({days} days old, {size}).")
+
+
 def repair():
     act = active_profile()
     cfg = config()
@@ -1317,6 +1368,7 @@ def repair():
         p = PROFILES / str(n)
         if p.is_dir() and n == active_profile():
             print(f"WARNING: profile {n} is active but {p} also exists – please check manually.")
+    prune_workspace_backups()
 
 
 def sync_current(dry_run=False):
@@ -1381,6 +1433,12 @@ def status(as_json=False):
         else:
             state = "   ".join(fmt_window(w) for w in p["windows"]) + f"   {p['sessions']} sessions"
         print(f" {mark} {p['n']}  {p['label']:16} {state}")
+    backups = workspace_backups()
+    if backups:
+        where = str(WORKSPACE_BACKUPS).replace(str(HOME), "~", 1)
+        oldest = time.strftime("%Y-%m-%d", time.localtime(backups[0][1]))
+        print(f"\n Workspace backups: {len(backups)} in {where} (oldest from {oldest}); "
+              f"`claude-profiles repair` removes those older than {BACKUP_DAYS} days.")
 
 
 def main(argv):
