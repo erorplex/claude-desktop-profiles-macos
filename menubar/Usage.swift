@@ -77,3 +77,19 @@ struct Profile: Decodable {
 }
 
 struct Status: Decodable { let active: Int?; let profiles: [Profile] }
+
+/// What the menu bar item shows. The symbol alone tells the states apart, so the text
+/// beside it can be switched off; it then moves to the tooltip.
+struct StatusItemLook: Equatable {
+    let symbol: String
+    let text: String
+
+    static let starting = StatusItemLook(symbol: "person.2.circle", text: "Profiles")
+    static let switching = StatusItemLook(symbol: "arrow.triangle.2.circlepath.circle", text: "switching…")
+    static let cliMissing = StatusItemLook(symbol: "exclamationmark.circle", text: "Profiles: CLI missing")
+
+    static func idle(_ status: Status) -> StatusItemLook {
+        guard let active = status.profiles.first(where: { $0.active }) else { return starting }
+        return StatusItemLook(symbol: starting.symbol, text: active.menuBarTitle)
+    }
+}

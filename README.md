@@ -33,6 +33,8 @@ The app is ad-hoc signed (no Apple developer account involved). If macOS refuses
 
 Click the person icon in the menu bar (top right, next to the clock) and pick a profile. The menu shows the percentage **remaining** in each profile's 5-hour and 7-day windows — plus every per-model window and confirmed reset times, once you have [recorded them](#plan-limits-in-the-menu). The menu bar highlights whichever general limit has less remaining: for example, 14% used over five hours and 96% used over seven days becomes **7 d 4% left**. Per-model caps remain visible in the menu without being presented as a limit on the entire account. The menu also shows how old the cached usage is; Refresh rereads saved data, it does not query Claude's servers. ⌘1–⌘9 switch directly.
 
+**Crowded menu bar?** macOS hides menu bar items that do not fit, and on a MacBook with a notch the wide *Account 1 · 7 d 4% left* item is often the first to disappear. Uncheck *Show Name and Limit in Menu Bar* in the menu to keep only the icon: hovering over it shows the active profile and its limit, the menu still has everything else, and the icon turns into arrows while a switch is running. To keep it visible, hold ⌘ and drag it towards the clock.
+
 **Adding an account:** choose *Add profile…*. Claude relaunches signed out — sign in with the other account and open the *Code* tab once. Wait for the switcher to relaunch Claude again and confirm that sessions were added before starting work. From then on the profile stays signed in. Repeat for as many accounts as you have. If sign-in takes more than about 15 minutes, finish signing in and opening the Code tab, then switch away and back to sync sessions.
 
 Everything is also available from the terminal:
