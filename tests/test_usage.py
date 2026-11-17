@@ -68,6 +68,27 @@ class UsageTests(unittest.TestCase):
         self.assertIsNone(five_hour["resetsAt"])
         self.assertEqual(five_hour["percentUsed"], 0)
 
+    def samples(self, *values):
+        samples = [{"t": (self.now + offset) * 1000, "org": "test-org", "u": u} for offset, u in values]
+        (self.cli.LIVE / "plan-usage-history.json").write_text(json.dumps({"samples": samples}))
+
+    def test_plan_without_five_hour_window_shows_only_the_weekly_one(self):
+        # The app stopped reporting fh: the newest sample decides, older ones with fh do not.
+        self.samples((-86400, {"fh": 14, "sd": 40}), (-60, {"sd": 3}))
+        windows = self.windows()
+        self.assertEqual(list(windows), ["weekly"])
+        self.assertEqual(windows["weekly"]["percentUsed"], 3)
+
+    def test_missing_five_hour_window_is_not_shown_as_reset_after_five_hours(self):
+        self.samples((-6 * 3600, {"sd": 3}))
+        self.assertEqual(list(self.windows()), ["weekly"])
+
+    def test_unknown_values_still_show_both_windows(self):
+        self.samples((-60, {"fh": None, "sd": 3}))
+        self.assertIsNone(self.windows()["five_hour"]["percentUsed"])
+        (self.cli.LIVE / "plan-usage-history.json").unlink()
+        self.assertEqual(sorted(self.windows()), ["five_hour", "weekly"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
