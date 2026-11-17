@@ -288,6 +288,22 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(self.r.routine_ids(3), {"andere"})
         self.assertEqual(self.r.routine_ids(1), {"andere"}, "auch das geparkte Konto 1 verliert sie sofort")
 
+    def test_anmeldung_mit_anderem_konto_loescht_keine_routinen(self):
+        """Meldet sich in einem Profil ein anderes Konto an, legt die App dort eine neue, leere Registrierung
+        an. Was darin fehlt, wurde nie geloescht: die Routinen bleiben ueberall und ziehen ins neue Konto ein."""
+        self.r.set_routines([self.routine(), self.routine("andere")])
+        self.r.switch(2)
+        konto = "a4444444-4444-4444-4444-444444444444"
+        neu = Path("claude-code-sessions", konto, "o4444444-4444-4444-4444-444444444444", "scheduled-tasks.json")
+        (self.r.pdir(2) / neu).parent.mkdir(parents=True)
+        (self.r.pdir(2) / neu).write_text(json.dumps({"scheduledTasks": [], "recordedSkips": {}}))
+        (self.r.pdir(2) / "config.json").write_text(json.dumps({"lastKnownAccountUuid": konto}))
+        self.r.switch(1)
+        self.assertEqual(self.r.routine_ids(1), {"limits", "andere"}, "die leere neue Datei ist kein Loeschauftrag")
+        self.r.switch(2)
+        d = json.loads((self.r.pdir(2) / neu).read_text())
+        self.assertEqual({t["id"] for t in d["scheduledTasks"]}, {"limits", "andere"}, "sie ziehen ins neue Konto ein")
+
     def test_eigene_routine_eines_kontos_bleibt_beim_ersten_abgleich(self):
         a, o = ACCT[2]
         p = self.r.sup / "Claude-profiles" / "2" / "claude-code-sessions" / a / o / "scheduled-tasks.json"
