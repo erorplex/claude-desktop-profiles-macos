@@ -23,6 +23,12 @@ assert(profile(nil, nil).menuBarTitle == "Account 1  limits unknown")
 assert(profile(100, 0).limitingWindow?.remainingPercent == 0)
 assert(profile(140, 0).limitingWindow?.remainingPercent == 0)
 assert(profile(-10, nil).limitingWindow?.remainingPercent == 100)
+// Signed in with another account than the label was given for; older CLIs send no flag at all.
+assert(weekly.accountWarning == nil)
+let changed = try! JSONDecoder().decode(Profile.self, from: Data(
+    #"{"n": 2, "label": "work", "active": true, "logged_in": true, "sessions": 0, "account_changed": true}"#.utf8))
+assert(changed.accountWarning != nil)
+assert(changed.menuBarTitle == "⚠︎ work  limits unknown")
 let future = (Date().timeIntervalSince1970 + 86400) * 1000
 assert(Window(key: "weekly", label: nil, percentUsed: 96, resetsAt: future, estimated: true).reset == nil)
 assert(Window(key: "weekly", label: nil, percentUsed: 96, resetsAt: future, estimated: false).reset != nil)
