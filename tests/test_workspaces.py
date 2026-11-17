@@ -1,7 +1,10 @@
 """Workspace preservation regressions: real temporary Git repos, no real app/account access."""
+import contextlib
+import io
 import json
 import os
 import subprocess
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -285,6 +288,38 @@ class WorkspaceTests(unittest.TestCase):
         original, _ = self.make_scratch(); self.r.switch(2)
         self.cli.do_remove(['1', '--yes'])
         self.assertEqual((original / 'notes.txt').read_text(), 'initial context')
+
+    def backup(self, days):
+        b = self.cli.PROFILES / 'shared' / 'workspace-backups' / f'backup-{days}'
+        (b / 'profile-Claude-0').mkdir(parents=True)
+        (b / 'profile-Claude-0' / 'notes.txt').write_text('original copy')
+        t = time.time() - days * 86400
+        os.utime(b, (t, t))
+        return b
+
+    def run_quietly(self, fn, *args, **kwargs):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            fn(*args, **kwargs)
+        return out.getvalue()
+
+    def test_repair_removes_only_old_workspace_backups(self):
+        self.cli.SCRATCH.mkdir(parents=True)
+        old, recent = self.backup(40), self.backup(5)
+        out = self.run_quietly(self.cli.repair)
+        self.assertFalse(old.exists())
+        self.assertTrue((recent / 'profile-Claude-0' / 'notes.txt').is_file())
+        self.assertIn('Removed workspace backup backup-40', out)
+
+    def test_repair_keeps_backups_while_shared_workspaces_are_missing(self):
+        old = self.backup(40)
+        out = self.run_quietly(self.cli.repair)
+        self.assertTrue((old / 'profile-Claude-0' / 'notes.txt').is_file(), 'they are the only copy then')
+        self.assertIn('restore it from', out)
+
+    def test_status_lists_workspace_backups(self):
+        self.backup(5)
+        self.assertIn('Workspace backups: 1', self.run_quietly(self.cli.status))
+        json.loads(self.run_quietly(self.cli.status, as_json=True))     # the menu bar's JSON stays unchanged
 
 
 if __name__ == '__main__':
