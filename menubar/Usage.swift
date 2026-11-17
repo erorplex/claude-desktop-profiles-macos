@@ -44,6 +44,12 @@ struct Profile: Decodable {
     let sd: Int?
     let windows: [Window]?
     let age: Int?
+    let account_changed: Bool?   // nil from CLIs that do not check accounts yet
+
+    /// Set when the profile is signed in with another account than the one its label was given for.
+    var accountWarning: String? {
+        account_changed == true ? "Signed in with a different account than before" : nil
+    }
 
     var usageWindows: [Window] {
         if let windows, !windows.isEmpty { return windows }
@@ -63,9 +69,10 @@ struct Profile: Decodable {
     }
 
     var menuBarTitle: String {
-        guard logged_in else { return label + "  (sign in)" }
-        guard let window = limitingWindow else { return label + "  limits unknown" }
-        return label + "  ·  " + window.short + " " + window.remaining
+        let warn = accountWarning == nil ? "" : "⚠︎ "
+        guard logged_in else { return warn + label + "  (sign in)" }
+        guard let window = limitingWindow else { return warn + label + "  limits unknown" }
+        return warn + label + "  ·  " + window.short + " " + window.remaining
     }
 
     var updated: String {
@@ -77,3 +84,19 @@ struct Profile: Decodable {
 }
 
 struct Status: Decodable { let active: Int?; let profiles: [Profile] }
+
+/// What the menu bar item shows. The symbol alone tells the states apart, so the text
+/// beside it can be switched off; it then moves to the tooltip.
+struct StatusItemLook: Equatable {
+    let symbol: String
+    let text: String
+
+    static let starting = StatusItemLook(symbol: "person.2.circle", text: "Profiles")
+    static let switching = StatusItemLook(symbol: "arrow.triangle.2.circlepath.circle", text: "switching…")
+    static let cliMissing = StatusItemLook(symbol: "exclamationmark.circle", text: "Profiles: CLI missing")
+
+    static func idle(_ status: Status) -> StatusItemLook {
+        guard let active = status.profiles.first(where: { $0.active }) else { return starting }
+        return StatusItemLook(symbol: starting.symbol, text: active.menuBarTitle)
+    }
+}

@@ -20,7 +20,8 @@ syncs Code-tab sessions into the parked target, renames the two directories
   claude-profiles usage-record        store the active account's plan limits (JSON on stdin,
                                       as a Claude Code session's get_usage reports them)
   claude-profiles status --json       machine-readable (used by the menu bar app)
-  claude-profiles repair              fix directory state after an interrupted switch
+  claude-profiles repair              fix directory state after an interrupted switch and
+                                      remove workspace backups older than 30 days
   claude-profiles sync                repair current sessions/workspaces (relaunches the app)
 """
 import fcntl, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, uuid
@@ -34,6 +35,8 @@ APP_SUPPORT = Path(os.environ.get("CLAUDE_PROFILES_APP_SUPPORT", HOME / "Library
 LIVE = APP_SUPPORT / "Claude"
 PROFILES = APP_SUPPORT / "Claude-profiles"
 SCRATCH = PROFILES / "shared" / "scratch-workspaces"
+WORKSPACE_BACKUPS = PROFILES / "shared" / "workspace-backups"   # originals set aside by the workspace migration
+BACKUP_DAYS = 30                                                 # repair removes backups older than this
 WORKTREES = "git-worktrees.json"
 MARKER = ".claude-profiles-id"
 CONFIG = Path(os.environ.get("CLAUDE_PROFILES_CONFIG", HOME / ".config/claude-profiles/config.json"))
@@ -236,7 +239,7 @@ class ScratchPlan:
 
     @contextmanager
     def apply(self):
-        backup = PROFILES / "shared" / "workspace-backups" / uuid.uuid4().hex
+        backup = WORKSPACE_BACKUPS / uuid.uuid4().hex
         staged = None
         replaced = []
         additions = []
@@ -324,6 +327,7 @@ def switch_lock():
 def config():
     c = read_object(CONFIG, {})
     c.setdefault("labels", {})
+    c.setdefault("accounts", {})      # profile -> account its label belongs to
     c.setdefault("profiles", DEFAULT_PROFILES)
     return c
 
@@ -491,7 +495,8 @@ def rate_limit_resets():
 def usage(pdir, blocked=None):
     """What is left of the account's limits: the app's own samples (fh = 5-hour %, sd = 7-day %)
     merged with our recorded windows, which also know the per-model limits and the reset times.
-    A window whose reset time has passed is empty again, however old the numbers are."""
+    A window whose reset time has passed is empty again, however old the numbers are. A window the
+    app's newest sample does not mention at all is one the plan does not have (weekly-only plans)."""
     now = time.time()
     samples = (load_json(pdir / "plan-usage-history.json", None) or {}).get("samples") or []
     s = samples[-1] if samples else None
@@ -519,8 +524,11 @@ def usage(pdir, blocked=None):
             win = {"key": key, "label": w.get("label"), "percentUsed": pct, "resetsAt": resets}
             windows.append(win)
     else:
-        for key, label, pct, period in (("five_hour", "5-hour limit", u.get("fh"), FIVE_H),
-                                        ("weekly", "Weekly · all models", u.get("sd"), SEVEN_D)):
+        for key, label, field, period in (("five_hour", "5-hour limit", "fh", FIVE_H),
+                                          ("weekly", "Weekly · all models", "sd", SEVEN_D)):
+            if u and field not in u:                   # not part of this plan: neither unknown nor reset
+                continue
+            pct = u.get(field)
             if h_t and now - h_t > period:             # the window has certainly reset
                 pct = 0
             windows.append({"key": key, "label": label, "percentUsed": pct, "resetsAt": None})
@@ -540,6 +548,12 @@ def logged_in(pdir):
     return any(k.startswith("oauth:tokenCache") for k in c) or "lastKnownAccountUuid" in c
 
 
+def account_of(pdir):
+    """The account a profile was last signed in with, as Claude records it (no credentials involved)."""
+    a = load_json(pdir / "config.json", {}).get("lastKnownAccountUuid")
+    return a if isinstance(a, str) and a else None
+
+
 def profiles():
     cfg = config()
     act = active_profile()
@@ -549,12 +563,15 @@ def profiles():
         d = profile_dir(n)
         exists = d.is_dir()
         idx = index_dir(d) if exists else None
+        acct, bound = account_of(d) if exists else None, cfg["accounts"].get(str(n))
         out.append({
             "n": n,
             "label": cfg["labels"].get(str(n), f"Account {n}"),
             "active": n == act,
             "exists": exists,
             "logged_in": exists and logged_in(d),
+            # signed in with another account than the one the label was given for
+            "account_changed": bool(acct and bound and acct != bound),
             "sessions": len(list(idx.glob("local_*.json"))) if idx else 0,
             **(usage(d, blocked.get(idx.parent.name) if idx else None) if exists
                else {"fh": None, "sd": None, "age": None, "windows": []}),
@@ -837,7 +854,8 @@ def sync_routines(target_n, source_n, dirs, plan):
     prompts live in the shared ~/.claude/scheduled-tasks. Treat them like sessions: every profile gets every
     routine, the profile just left decides the definition, the newest run state wins everywhere (so a slot
     that already ran is not caught up again after the switch), and a routine deleted in the profile just
-    left is removed from all profiles at once."""
+    left is removed from all profiles at once - provided that profile still uses the file the last switch
+    wrote."""
     files = {n: index_dir(d) / ROUTINES for n, d in dirs.items() if index_dir(d)}
     if target_n not in files:
         return
@@ -852,8 +870,17 @@ def sync_routines(target_n, source_n, dirs, plan):
     tasks = {n: {x["id"]: x for x in (d or {}).get("scheduledTasks", []) if isinstance(x, dict) and x.get("id")}
              for n, d in data.items()}
     snap = read_object(ROUTINES_SNAPSHOT, {})
-    known = set(snap.get("ids", [])) if snap.get("target") == source_n else set()
-    gone = known - set(tasks.get(source_n, {})) if data.get(source_n) is not None else set()
+    where = {n: f"{f.parent.parent.name}/{f.parent.name}" for n, f in files.items()}
+    missing = set()
+    if snap.get("target") == source_n and data.get(source_n) is not None:
+        missing = set(snap.get("ids", [])) - set(tasks.get(source_n, {}))
+    # Only the file the last switch wrote can report a deletion. After a sign-in with another account (or a
+    # move to another organization) the app starts a new, empty file: what is missing there was never
+    # deleted and is carried into that file below. Snapshots from older versions name no file at all.
+    gone = missing if snap.get("index") == where.get(source_n) else set()
+    if missing and not gone:
+        log(f"profile {source_n} now registers routines in {where.get(source_n)} instead of "
+            f"{snap.get('index') or 'an unrecorded file'}: {len(missing)} missing there are kept, not deleted")
     for n in tasks:
         dropped = gone & set(tasks[n])
         for rid in dropped:
@@ -879,7 +906,7 @@ def sync_routines(target_n, source_n, dirs, plan):
         if out != data.get(target_n):
             plan.add(files[target_n], out)
             log(f"routines -> profile {target_n}: {len(merged)} ({', '.join(merged) or 'none'})")
-    plan.add(ROUTINES_SNAPSHOT, {"target": target_n, "ids": sorted(merged)})
+    plan.add(ROUTINES_SNAPSHOT, {"target": target_n, "index": where[target_n], "ids": sorted(merged)})
 
 
 def write_archive_index(idx, archived, known, plan):
@@ -1040,7 +1067,10 @@ def switch_profile(target):
             if src_cfg is not None:
                 plan.add(incoming / "claude_desktop_config.json", src_cfg)
         plan.writes[incoming / MARKER] = str(target).encode()
-        plan.add(CONFIG, {**cfg, "active": target})
+        accounts, leaving = dict(cfg["accounts"]), account_of(LIVE)
+        if leaving and str(act) not in accounts:          # first switch away: the label is this account
+            accounts[str(act)] = leaving
+        plan.add(CONFIG, {**cfg, "active": target, "accounts": accounts})
         if not NO_APP and claude_pids():
             raise RuntimeError("Claude restarted during the switch; profile directories were not moved")
         with plan.apply():
@@ -1240,6 +1270,7 @@ def do_remove(args):
     if d.is_dir():
         shutil.rmtree(d)
     cfg["labels"].pop(str(n), None)
+    cfg["accounts"].pop(str(n), None)
     if n == n_profiles():                     # removing the last slot shrinks the list; others stay as empty slots
         cfg["profiles"] = max(2, n - 1)
     save_json(CONFIG, cfg)
@@ -1311,6 +1342,54 @@ def do_import(args):
 
 # ---------- repair & status ----------
 
+def workspace_backups():
+    """Originals the one-time workspace migration set aside, oldest first: [(path, last modified)]."""
+    if not WORKSPACE_BACKUPS.is_dir():
+        return []
+    found = [(p, p.stat().st_mtime) for p in WORKSPACE_BACKUPS.iterdir() if p.is_dir() and not p.is_symlink()]
+    return sorted(found, key=lambda b: b[1])
+
+
+def tree_size(path):
+    total = 0
+    for parent, _, files in os.walk(path, followlinks=False):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(parent, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def fmt_size(n):
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def prune_workspace_backups():
+    """A migration that went wrong shows up within days, so backups older than BACKUP_DAYS go - but never
+    while the shared tree they were merged into is missing, because then they are the only copy."""
+    now = time.time()
+    old = [(p, t) for p, t in workspace_backups() if now - t > BACKUP_DAYS * 86400]
+    if not old:
+        return
+    if not SCRATCH.is_dir():
+        print(f"Kept {len(old)} old workspace backup(s): {SCRATCH} is missing; restore it from {WORKSPACE_BACKUPS} first.")
+        return
+    for p, t in old:
+        days, size = int((now - t) / 86400), fmt_size(tree_size(p))
+        try:
+            shutil.rmtree(p)
+        except OSError as e:
+            print(f"Could not remove workspace backup {p}: {e}")
+            continue
+        log(f"removed workspace backup {p.name} ({days} days old, {size})")
+        print(f"Removed workspace backup {p.name} ({days} days old, {size}).")
+
+
 def repair():
     act = active_profile()
     cfg = config()
@@ -1336,6 +1415,7 @@ def repair():
         p = PROFILES / str(n)
         if p.is_dir() and n == active_profile():
             print(f"WARNING: profile {n} is active but {p} also exists – please check manually.")
+    prune_workspace_backups()
 
 
 def sync_current(dry_run=False):
@@ -1399,7 +1479,15 @@ def status(as_json=False):
             state = "not signed in"
         else:
             state = "   ".join(fmt_window(w) for w in p["windows"]) + f"   {p['sessions']} sessions"
+        if p["account_changed"]:
+            state += "   ⚠ signed in with a different account than before"
         print(f" {mark} {p['n']}  {p['label']:16} {state}")
+    backups = workspace_backups()
+    if backups:
+        where = str(WORKSPACE_BACKUPS).replace(str(HOME), "~", 1)
+        oldest = time.strftime("%Y-%m-%d", time.localtime(backups[0][1]))
+        print(f"\n Workspace backups: {len(backups)} in {where} (oldest from {oldest}); "
+              f"`claude-profiles repair` removes those older than {BACKUP_DAYS} days.")
 
 
 def main(argv):
@@ -1431,7 +1519,13 @@ def run_command(argv):
         return do_remove(args)
     if cmd == "label" and len(args) >= 2:
         cfg = config()
-        cfg["labels"][str(resolve(args[0]))] = " ".join(args[1:])
+        n = resolve(args[0])
+        cfg["labels"][str(n)] = " ".join(args[1:])
+        acct = account_of(profile_dir(n))         # the label now names the account signed in there
+        if acct:
+            cfg["accounts"][str(n)] = acct
+        else:
+            cfg["accounts"].pop(str(n), None)
         save_json(CONFIG, cfg)
         return status()
     if cmd == "profiles" and len(args) == 1 and args[0].isdigit():

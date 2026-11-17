@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 func profile(_ fh: Int?, _ weekly: Int?, extra: [[String: Any]] = []) -> Profile {
     var windows: [[String: Any]] = []
@@ -23,9 +23,25 @@ assert(profile(nil, nil).menuBarTitle == "Account 1  limits unknown")
 assert(profile(100, 0).limitingWindow?.remainingPercent == 0)
 assert(profile(140, 0).limitingWindow?.remainingPercent == 0)
 assert(profile(-10, nil).limitingWindow?.remainingPercent == 100)
+// Signed in with another account than the label was given for; older CLIs send no flag at all.
+assert(weekly.accountWarning == nil)
+let changed = try! JSONDecoder().decode(Profile.self, from: Data(
+    #"{"n": 2, "label": "work", "active": true, "logged_in": true, "sessions": 0, "account_changed": true}"#.utf8))
+assert(changed.accountWarning != nil)
+assert(changed.menuBarTitle == "⚠︎ work  limits unknown")
 let future = (Date().timeIntervalSince1970 + 86400) * 1000
 assert(Window(key: "weekly", label: nil, percentUsed: 96, resetsAt: future, estimated: true).reset == nil)
 assert(Window(key: "weekly", label: nil, percentUsed: 96, resetsAt: future, estimated: false).reset != nil)
 assert(Window(key: "weekly", label: nil, percentUsed: 96, resetsAt: 1, estimated: false).reset == nil)
 assert(Window(key: "weekly", label: nil, percentUsed: 96, resetsAt: nil, estimated: nil).reset == nil)
+
+// Icon only: the symbol has to tell the states apart, and a misspelled one would leave no icon at all.
+assert(StatusItemLook.idle(Status(active: 1, profiles: [weekly])) ==
+       StatusItemLook(symbol: "person.2.circle", text: "Account 1  ·  7 d 4% left"))
+assert(StatusItemLook.idle(Status(active: nil, profiles: [])) == .starting)
+let looks = [StatusItemLook.starting, .switching, .cliMissing]
+assert(Set(looks.map { $0.symbol }).count == looks.count)
+for look in looks {
+    assert(NSImage(systemSymbolName: look.symbol, accessibilityDescription: nil) != nil, "unknown symbol \(look.symbol)")
+}
 print("Menu usage tests passed")

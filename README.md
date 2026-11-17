@@ -33,7 +33,11 @@ The app is ad-hoc signed (no Apple developer account involved). If macOS refuses
 
 Click the person icon in the menu bar (top right, next to the clock) and pick a profile. The menu shows the percentage **remaining** in each profile's 5-hour and 7-day windows — plus every per-model window and confirmed reset times, once you have [recorded them](#plan-limits-in-the-menu). The menu bar highlights whichever general limit has less remaining: for example, 14% used over five hours and 96% used over seven days becomes **7 d 4% left**. Per-model caps remain visible in the menu without being presented as a limit on the entire account. The menu also shows how old the cached usage is; Refresh rereads saved data, it does not query Claude's servers. ⌘1–⌘9 switch directly.
 
+**Crowded menu bar?** macOS hides menu bar items that do not fit, and on a MacBook with a notch the wide *Account 1 · 7 d 4% left* item is often the first to disappear. Uncheck *Show Name and Limit in Menu Bar* in the menu to keep only the icon: hovering over it shows the active profile and its limit, the menu still has everything else, and the icon turns into arrows while a switch is running. To keep it visible, hold ⌘ and drag it towards the clock.
+
 **Adding an account:** choose *Add profile…*. Claude relaunches signed out — sign in with the other account and open the *Code* tab once. Wait for the switcher to relaunch Claude again and confirm that sessions were added before starting work. From then on the profile stays signed in. Repeat for as many accounts as you have. If sign-in takes more than about 15 minutes, finish signing in and opening the Code tab, then switch away and back to sync sessions. The same applies if Claude cannot quit for that sync (for example while a dialog is open): the notification says that the switch itself is done and only the sessions are missing.
+
+**Which account is which:** name each profile after the account it uses, for example `claude-profiles label 2 you@work.com`. A label belongs to the account that was signed in when you set it (or, without a label, when you first switched away from the profile). If the profile is later signed in with a different account — easy to do after being signed out — the menu marks it with ⚠︎ until you sign in with the right account again, or run `label` again to confirm the new one. Claude does not keep the account's email address on disk, so the switcher cannot show it by itself.
 
 Everything is also available from the terminal:
 
@@ -43,7 +47,7 @@ claude-profiles 2               # switch to profile 2 (or: claude-profiles work)
 claude-profiles next            # next signed-in profile
 claude-profiles add work        # new profile slot (add --switch: switch into it right away)
 claude-profiles remove 3        # delete a parked profile's sign-in and data (asks first)
-claude-profiles label 2 work    # name a profile
+claude-profiles label 2 work    # name a profile (after the account signed in there)
 claude-profiles sync --dry-run  # check existing sessions/workspaces without restarting
 claude-profiles sync            # repair the current profile after upgrading (relaunches Claude)
 ```
@@ -61,7 +65,7 @@ Titles come from the first message; sessions whose working directory no longer e
 
 ### Plan limits in the menu
 
-Claude Desktop writes how full the 5-hour and the 7-day window are into `plan-usage-history.json` — but not the per-model windows and not when a window resets. Those numbers exist only inside the app, for the account that is signed in right now. `usage-record` stores them next to the app's own file:
+Claude Desktop writes how full the 5-hour and the 7-day window are into `plan-usage-history.json` (plans without a 5-hour window report only the 7-day one, and the menu then shows just that) — but not the per-model windows and not when a window resets. Those numbers exist only inside the app, for the account that is signed in right now. `usage-record` stores them next to the app's own file:
 
 ```bash
 claude-profiles usage-record < plan.json   # plan.json: the plan block as get_usage reports it
@@ -86,7 +90,7 @@ Claude Desktop keeps everything about the signed-in account in `~/Library/Applic
 
 Session transcripts and subagent histories live in `~/.claude/projects` and are already shared by all profiles. The switcher leaves those files untouched. Local MCP servers (`claude_desktop_config.json`) are shared too. Credentials stay in their own profile directory; the switcher does not extract them or sign in on your behalf — sign-in happens in Claude's own flow.
 
-**Working folders now follow their sessions.** Earlier versions copied session cards without `scratch-workspaces` or `git-worktrees.json`. A switch could therefore show "Working folder no longer exists" or try to create a Git branch already checked out in the session's original worktree. On the first switch (or `sync` after upgrading), scratch directories from every profile are consolidated under `Claude-profiles/shared/scratch-workspaces`; each profile gets a directory symlink to that stable location. Existing absolute session paths stay valid. Original directories remain under `shared/workspace-backups`. Different contents at the same path stop migration and identify both originals instead of silently picking one. Later edits and deletions affect the shared tree directly, so stale profiles cannot restore old files.
+**Working folders now follow their sessions.** Earlier versions copied session cards without `scratch-workspaces` or `git-worktrees.json`. A switch could therefore show "Working folder no longer exists" or try to create a Git branch already checked out in the session's original worktree. On the first switch (or `sync` after upgrading), scratch directories from every profile are consolidated under `Claude-profiles/shared/scratch-workspaces`; each profile gets a directory symlink to that stable location. Existing absolute session paths stay valid. Original directories remain under `shared/workspace-backups`; `claude-profiles` lists them, and `claude-profiles repair` removes backups older than 30 days (never while the shared tree is missing). Different contents at the same path stop migration and identify both originals instead of silently picking one. Later edits and deletions affect the shared tree directly, so stale profiles cannot restore old files.
 
 Git worktrees stay where they are. Their registry entries, leases and existing local origin records are merged to match each session's exact workspace identifiers before Claude launches. Workspace identifiers are carried together, so a recovered session cannot get its old path back through a field-by-field majority. The switcher does not detach branches, reset changes, run `git clean`, or recreate worktrees. Unknown registry schemas and ambiguous/missing registrations stop the switch for inspection.
 
@@ -112,7 +116,7 @@ Only one profile is in use between two switches, so whatever differs there from 
 
 Groups are matched by **name**, since each account has its own group ids.
 
-Routines keep their prompts in `~/.claude/scheduled-tasks`, which every profile shares anyway — but the app registers the *schedule* per account. A switch carries every registration into the target, with the newest run state, so a slot that already ran in one account is not caught up again in the next. A routine deleted in the profile you just left is removed from all profiles at once.
+Routines keep their prompts in `~/.claude/scheduled-tasks`, which every profile shares anyway — but the app registers the *schedule* per account. A switch carries every registration into the target, with the newest run state, so a slot that already ran in one account is not caught up again in the next. A routine deleted in the profile you just left is removed from all profiles at once — as long as that profile still uses the registration file of the last switch. After signing in with another account (or moving to another organization) the app starts a new, empty file; routines missing there were never deleted, so they stay everywhere and are carried into the new file instead.
 
 ## Caveats
 
